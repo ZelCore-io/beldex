@@ -10,8 +10,8 @@ add_subdirectory(wire)
 find_package(Boost 1.62 COMPONENTS filesystem regex)
 find_package(OpenSSL REQUIRED)
 
-set(beldex-lws-common_sources config.cpp error.cpp)
-set(beldex-lws-common_headers config.h error.h fwd.h)
+set(beldex-lws-common_sources config.cpp error.cpp scan_planner.cpp)
+set(beldex-lws-common_headers config.h error.h fwd.h scan_planner.h)
 
 add_library(beldex-lws-common ${beldex-lws-common_sources} ${beldex-lws-common_headers})
 target_link_libraries(beldex-lws-common beldex-lws-db)

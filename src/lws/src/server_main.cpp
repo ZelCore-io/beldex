@@ -24,6 +24,8 @@
 //#include "rpc/client.h"
 #include "options.h"
 #include "rest_server.h"
+#include <algorithm>
+#include "rpc/admin.h"
 #include "scanner.h"
 
 namespace
@@ -38,9 +40,14 @@ namespace
     const command_line::arg_descriptor<std::string> rest_ssl_cert;
     const command_line::arg_descriptor<std::size_t> rest_threads;
     const command_line::arg_descriptor<std::size_t> scan_threads;
+    const command_line::arg_descriptor<std::uint64_t> max_group_span;
+    const command_line::arg_descriptor<std::uint64_t> scan_batch_size;
+    const command_line::arg_descriptor<bool> no_blob_transport;
+    const command_line::arg_descriptor<std::uint64_t> account_idle_days;
     const command_line::arg_descriptor<std::vector<std::string>> access_controls;
     const command_line::arg_descriptor<bool> external_bind;
     const command_line::arg_descriptor<unsigned> create_queue_max;
+    const command_line::arg_descriptor<bool> require_account_approval;
     const command_line::arg_descriptor<std::chrono::minutes::rep> rates_interval;
     const command_line::arg_descriptor<unsigned short> log_level;
     const command_line::arg_descriptor<std::string> config_file;
@@ -70,9 +77,14 @@ namespace
       , rest_ssl_cert{"rest-ssl-certificate", "<path> to PEM formatted SSL certificate (chains supported) for https REST server", ""}
       , rest_threads{"rest-threads", "Number of threads to process REST connections", 1}
       , scan_threads{"scan-threads", "Maximum number of threads for account scanning", boost::thread::hardware_concurrency()}
+      , max_group_span{"max-group-span", "Maximum scan-height spread within one scan thread; accounts above a group's lowest height idle until it catches up", 10000}
+      , scan_batch_size{"scan-batch-size", "Blocks requested per daemon call (daemon caps at 1000); halved on timeout, ramped on success", 1000}
+      , no_blob_transport{"no-blob-transport", "Use the legacy JSON block transport instead of raw blobs", false}
+      , account_idle_days{"account-idle-days", "Stop scanning accounts untouched for this many days; they reactivate on their next login and resume from their stored height. 0 disables (30 is a sensible starting point)", 0}
       , access_controls{"access-control-origin", "Specify a whitelisted HTTP control origin domain"}
       , external_bind{"confirm-external-bind", "Allow listening for external connections", false}
       , create_queue_max{"create-queue-max", "Set pending create account requests maximum", 10000}
+      , require_account_approval{"require-account-approval", "Queue new logins for admin approval instead of activating them immediately", false}
       , rates_interval{"exchange-rate-interval", "Retrieve exchange rates in minute intervals from cryptocompare.com if greater than 0", 0}
       , log_level{"log-level", "Log level [0-4]", 1}
       , config_file{"config-file", "Specify any option in a config file; <name>=<value> on separate lines"}
@@ -91,9 +103,14 @@ namespace
       command_line::add_arg(description, rest_ssl_cert);
       command_line::add_arg(description, rest_threads);
       command_line::add_arg(description, scan_threads);
+      command_line::add_arg(description, max_group_span);
+      command_line::add_arg(description, scan_batch_size);
+      command_line::add_arg(description, no_blob_transport);
+      command_line::add_arg(description, account_idle_days);
       command_line::add_arg(description, access_controls);
       command_line::add_arg(description, external_bind);
       command_line::add_arg(description, create_queue_max);
+      command_line::add_arg(description, require_account_approval);
       command_line::add_arg(description, rates_interval);
       command_line::add_arg(description, log_level);
       command_line::add_arg(description, config_file);
@@ -108,7 +125,7 @@ namespace
     std::string daemon_rpc;
     std::string daemon_sub;
     std::chrono::minutes rates_interval;
-    std::size_t scan_threads;
+    lws::scanner_options scan;
     unsigned create_queue_max;
   };
 
@@ -154,6 +171,7 @@ namespace
     }
 
     opts.set_network(args); // do this first, sets global variable :/
+    lws::config::auto_accept_accounts = !command_line::get_arg(args, opts.require_account_approval);
     mlog_set_log_level(command_line::get_arg(args, opts.log_level));
 
     program prog{
@@ -168,12 +186,17 @@ namespace
         command_line::get_arg(args, opts.daemon_rpc),
         command_line::get_arg(args, opts.daemon_sub),
         std::chrono::minutes{command_line::get_arg(args, opts.rates_interval)},
-        command_line::get_arg(args, opts.scan_threads),
+        lws::scanner_options{
+            command_line::get_arg(args, opts.scan_threads),
+            command_line::get_arg(args, opts.max_group_span),
+            command_line::get_arg(args, opts.scan_batch_size),
+            !command_line::get_arg(args, opts.no_blob_transport),
+            command_line::get_arg(args, opts.account_idle_days) * 24 * 60 * 60},
         command_line::get_arg(args, opts.create_queue_max),
     };
 
     prog.rest_config.threads = std::max(std::size_t(1), prog.rest_config.threads);
-    prog.scan_threads = std::max(std::size_t(1), prog.scan_threads);
+    prog.scan.thread_count = std::max(std::size_t(1), prog.scan.thread_count);
 
     // Detect IPC mode
   const bool ipc_mode = prog.daemon_rpc.rfind("ipc://", 0) == 0;
@@ -200,15 +223,33 @@ namespace
       lws::daemon_add = prog.daemon_rpc;
     return prog;
   }
+  //! \return The scan thread carrying `id`, for the `account_info` admin endpoint.
+  boost::optional<lws::rpc::account_scan_slot> find_scan_slot(lws::db::account_id id)
+  {
+    const lws::scanner_status status = lws::scanner::status();
+    for (const auto& thread : status.threads)
+    {
+      if (!thread.alive)
+        continue;
+      if (std::find(thread.accounts.begin(), thread.accounts.end(), id) == thread.accounts.end())
+        continue;
+      return lws::rpc::account_scan_slot{thread.index, thread.group_low, thread.group_high};
+    }
+    return boost::none;
+  }
+
   void run(program prog)
   {
     std::signal(SIGINT, [] (int) { lws::scanner::stop(); });
+    lws::rpc::account_scan_slot_of = &find_scan_slot;
     fs::create_directories(prog.db_path);
     auto disk = lws::db::storage::open(prog.db_path.c_str(), prog.create_queue_max);
     MINFO("Using beldexd RPC at " << prog.daemon_rpc);
 
-    lws::scanner::sync(disk.clone(),prog.daemon_rpc);
-
+    /* Bring the REST servers up before the initial chain sync. The sync walks
+       every block hash from the last stored height to the tip, which on a fresh
+       database is the whole chain - previously nothing answered until it
+       finished. The REST servers run on their own io_service threads. */
     lws::rest_server server{
       epee::to_span(prog.rest_servers), prog.admin_rest_servers, disk.clone(), std::move(prog.rest_config)
     };
@@ -217,9 +258,13 @@ namespace
     for (const std::string& address : prog.admin_rest_servers)
       MINFO("Listening for REST admin clients at " << address);
 
+    lws::scanner::sync(disk.clone(),prog.daemon_rpc);
+
         // blocks until SIGINT
-   lws::scanner::run(std::move(disk),prog.daemon_rpc, prog.scan_threads);
-    
+   lws::scanner::run(std::move(disk), prog.daemon_rpc, prog.scan);
+
+   if (lws::scanner::stopped_on_error())
+     throw std::runtime_error{"Scanner stopped because of an unrecoverable error"};
   }
 } // anonymous
 

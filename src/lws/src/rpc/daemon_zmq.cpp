@@ -15,7 +15,10 @@ namespace
   constexpr const std::size_t default_transaction_count = 100;
   constexpr const std::size_t default_inputs = 2;
   constexpr const std::size_t default_outputs = 4;
-  constexpr const std::size_t default_txextra_size = 40000048;
+  /* Real tx_extra is a tx public key plus an optional payment-id nonce - tens of
+     bytes. This used to read 40000048, which reserved 40MB per transaction
+     parsed and dominated the cost of every batch. */
+  constexpr const std::size_t default_txextra_size = 64;
 }
 
 namespace rct

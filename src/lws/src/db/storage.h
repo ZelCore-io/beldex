@@ -43,6 +43,39 @@ namespace db
   }
 
   struct storage_internal;
+
+  //! Per-account result of a single `storage::update` commit.
+  struct account_progress
+  {
+    account_id id;          //!< Account that was examined.
+    block_id old_height;    //!< Scan height held before the commit.
+    block_id new_height;    //!< Scan height held after the commit.
+  };
+
+  //! Outcome of `storage::update`, detailed enough to log and act on.
+  struct update_outcome
+  {
+    //! Accounts whose stored scan height moved forward.
+    std::vector<account_progress> advanced;
+    /*! Accounts already at or beyond the committed height. Not an error - the
+        batch simply had nothing new for them. */
+    std::vector<account_progress> unchanged;
+    /*! Accounts left untouched because the stored height no longer matches the
+        in-memory copy, or because the record could not be found. */
+    std::vector<account_id> diverged;
+    /*! Accounts for which a *lower* height was offered than the one already
+        stored. Always refused, and always also listed in `unchanged`.
+
+        Expected when a scan-thread group spans heights: the batch starts at the
+        group's lowest account and simply does not reach the ones above it. A
+        persistently non-empty list means the plan is mixing accounts that are
+        too far apart. */
+    std::vector<account_progress> regressions;
+
+    //! \return Accounts accounted for, i.e. everything except `diverged`.
+    std::size_t handled() const noexcept
+    { return advanced.size() + unchanged.size(); }
+  };
   
   struct reader_internal
   {
@@ -73,6 +106,12 @@ namespace db
 
     //! \return Last known block.
     expect<block_info> get_last_block() noexcept;
+
+    /*! \return When `id`'s scan height last moved forward, or 0 if never.
+
+      Stored in its own table rather than on the account record, so that adding
+      it did not change the account layout on disk. */
+    expect<account_time> get_last_progress(account_id id) noexcept;
 
     //! \return "Our" block hash at `height`.
     expect<crypto::hash> get_block_hash(const block_id height) noexcept;
@@ -171,8 +210,31 @@ namespace db
     */
     expect<void> sync_chain(block_id height, epee::span<const crypto::hash> hashes);
 
-    //! Bump the last access time of `address` to the current time.
-  //  expect<void> update_access_time(account_address const& address) noexcept;
+    /*! Bump the last access time of `address` to now.
+
+      Drives the idle sweep and the `access_time` an operator sees. Callers are
+      expected to debounce - see `access_tracker` in rest_server.cpp - because
+      this takes the single LMDB write lock, which the scanner also needs. */
+    expect<void> update_access_time(account_address const& address) noexcept;
+
+    /*! \return When this database first started recording real access times.
+
+      Before the access-time updater existed, `account.access` was written once
+      at creation and never touched, so on an upgraded database it is really the
+      creation time. Recorded on first call and used to hold the idle sweep off
+      until access data has actually been collected for a full timeout period.
+
+      Written on first call, so this is not a const operation. */
+    expect<account_time> access_tracking_since() noexcept;
+
+    /*! Move `active` accounts untouched since `cutoff` to `inactive`.
+
+      Scanning stops for them, but every output, spend, key image and the scan
+      height itself are kept, so a later login resumes from where it left off
+      rather than rescanning from the start height.
+
+      \return The addresses that were deactivated. */
+    expect<std::vector<account_address>> deactivate_idle(account_time cutoff);
 
     //! Change state of `address` to `status`. \return Updated `addresses`.
     expect<std::vector<account_address>>
@@ -182,9 +244,25 @@ namespace db
     //! Add an account, for immediate inclusion in the active list.
     expect<void> add_account(account_address const& address, crypto::secret_key const& key, account_flags flags =  static_cast<account_flags>(0)) noexcept;
 
-    //! Reset `addresses` to `height` for scanning.
+    /*!
+      Move `addresses` to `height` for scanning, in either direction.
+
+      \param height Target scan height; may be above or below the current one.
+      \param addresses Accounts to move.
+      \param purge Drop outputs, spends and key images recorded above `height`.
+        Needed whenever a rescan is meant to *repair* an account rather than just
+        re-confirm what is already stored.
+      \param chain_height Live chain tip to bound `height` against; pass 0 to use
+        the local chain table, which only advances during a sync pass.
+
+      \return The addresses that were moved.
+    */
     expect<std::vector<account_address>>
-      rescan(block_id height, epee::span<const account_address> addresses);
+      rescan(block_id height, epee::span<const account_address> addresses, bool purge = true, std::uint64_t chain_height = 0);
+
+    //! Permanently remove `addresses` and everything indexed against them.
+    expect<std::vector<account_address>>
+      delete_accounts(epee::span<const account_address> addresses);
 
     //! Add an account for later approval. For use with the login endpoint.
     expect<void> creation_request(account_address const& address, crypto::secret_key const& key, account_flags flags) noexcept;
@@ -209,13 +287,17 @@ namespace db
       `height` vs the stored account record is detected, the entire update will
       fail.
 
+      A stored scan height is never lowered. `height + chain.size() - 1` is the
+      height this batch reached; an account already beyond it keeps its own
+      height and is reported in `update_outcome::unchanged`.
+
       \param height The first hash in `chain` is at this height.
       \param chain List of block hashes that `accts` were scanned against.
-      \param accts Updated to `height + chain.size()` scan height.
+      \param accts Advanced to `height + chain.size() - 1` unless already beyond it.
 
-      \return True iff LMDB successfully committed the update.
+      \return Per-account outcome, or an LMDB error if the txn failed.
     */
-    expect<std::size_t> update(block_id height, epee::span<const crypto::hash> chain, epee::span<const lws::account> accts);
+    expect<update_outcome> update(block_id height, epee::span<const crypto::hash> chain, epee::span<const lws::account> accts);
 
     //! `txn` must have come from a previous call on the same thread.
     expect<storage_reader> start_read(lmdb::suspended_txn txn = nullptr) const;

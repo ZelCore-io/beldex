@@ -5,6 +5,7 @@
 #include <boost/program_options/variables_map.hpp>
 #include <boost/range/adaptor/filtered.hpp>
 #include <cassert>
+#include <chrono>
 #include <cstring>
 #include <iostream>
 #include <iterator>
@@ -18,6 +19,9 @@
 #include "epee/misc_log_ex.h"         // beldex/contrib/epee/include/epee
 #include "epee/span.h"                // beldex/contrib/epee/include
 #include "epee/string_tools.h"        // beldex/contrib/epee/include
+#include <boost/thread/thread.hpp>
+#include <limits>
+#include "lmdb/util.h"
 #include "options.h"
 #include "config.h"
 #include "rpc/admin.h"
@@ -73,12 +77,14 @@ namespace
   struct options : lws::options
   {
     const command_line::arg_descriptor<bool> show_sensitive;
+    const command_line::arg_descriptor<bool> no_purge;
     const command_line::arg_descriptor<std::string> command;
     const command_line::arg_descriptor<std::vector<std::string>> arguments;
 
     options()
       : lws::options()
       , show_sensitive{"show-sensitive", "Show view keys", false}
+      , no_purge{"no-purge", "rescan: keep outputs/spends above the target height", false}
       , command{"command", "Admin command to execute", ""}
       , arguments{"arguments", "Arguments to command"}
     {}
@@ -87,6 +93,7 @@ namespace
     {
       lws::options::prepare(description);
       command_line::add_arg(description, show_sensitive);
+      command_line::add_arg(description, no_purge);
       command_line::add_arg(description, command);
       command_line::add_arg(description, arguments);
     }
@@ -97,6 +104,7 @@ namespace
     lws::db::storage disk;
     std::vector<std::string> arguments;
     bool show_sensitive;
+    bool no_purge;
   };
 
   crypto::secret_key get_key(std::string const& hex)
@@ -245,12 +253,158 @@ namespace
 
     lws::rpc::rescan_req req{
         get_addresses(epee::to_span(prog.arguments)),
-        lws::db::block_id(std::stoull(prog.arguments[0]))
+        lws::db::block_id(std::stoull(prog.arguments[0])),
+        prog.no_purge ? boost::optional<bool>{false} : boost::optional<bool>{true}
       };
-      run_command(lws::rpc::rescan, out, std::move(prog.disk), std::move(req));
-  
-  
-  
+    run_command(lws::rpc::rescan, out, std::move(prog.disk), std::move(req));
+  }
+
+  void delete_account(program prog, std::ostream& out)
+  {
+    if (prog.arguments.empty())
+      throw std::runtime_error{"delete_account requires 1 or more addresses"};
+
+    std::vector<lws::db::account_address> addresses{};
+    addresses.reserve(prog.arguments.size());
+    for (std::string const& address : prog.arguments)
+      addresses.push_back(lws::db::address_string(address).value());
+
+    lws::rpc::delete_account_req req{std::move(addresses)};
+    run_command(lws::rpc::delete_account, out, std::move(prog.disk), std::move(req));
+  }
+
+  void account_info(program prog, std::ostream& out)
+  {
+    if (prog.arguments.size() != 1)
+      throw std::runtime_error{"account_info takes exactly one address"};
+
+    lws::rpc::account_info_req req{prog.arguments[0]};
+    run_command(lws::rpc::account_info, out, std::move(prog.disk), std::move(req));
+  }
+
+  /*! Print the thread partition the scanner would choose right now.
+
+    Mirrors `partition_by_height` in scanner.cpp. Groups whose height span is
+    wide are the ones where accounts near the top sit idle waiting for the
+    lowest to catch up, so they are flagged. */
+  void scan_plan(program prog, std::ostream& out)
+  {
+    if (1 < prog.arguments.size())
+      throw std::runtime_error{"scan_plan takes an optional thread count"};
+
+    const std::size_t thread_count = prog.arguments.empty()
+      ? std::max(1u, boost::thread::hardware_concurrency())
+      : std::stoul(prog.arguments[0]);
+    constexpr const std::uint64_t max_span = 10000;
+
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> accounts{}; // (height, id)
+    std::uint64_t chain_height = 0;
+    {
+      auto reader = MONERO_UNWRAP(prog.disk.start_read());
+      const auto last = reader.get_last_block();
+      if (last)
+        chain_height = std::uint64_t(last->id);
+
+      auto active = reader.get_accounts(lws::db::account_status::active);
+      if (active)
+      {
+        for (lws::db::account const& user : active->make_range())
+        {
+          accounts.emplace_back(
+            std::uint64_t(user.scan_height), std::uint64_t(lmdb::to_native(user.id))
+          );
+        }
+      }
+    }
+
+    std::sort(accounts.begin(), accounts.end());
+
+    // greedy bands, then merge cheapest adjacent pairs down to the thread budget
+    std::vector<std::vector<std::pair<std::uint64_t, std::uint64_t>>> groups{};
+    for (const auto& entry : accounts)
+    {
+      if (groups.empty() || max_span < entry.first - groups.back().front().first)
+        groups.emplace_back();
+      groups.back().push_back(entry);
+    }
+    while (thread_count < groups.size())
+    {
+      std::size_t best = 0;
+      std::uint64_t best_cost = std::numeric_limits<std::uint64_t>::max();
+      for (std::size_t i = 0; i + 1 < groups.size(); ++i)
+      {
+        const std::uint64_t cost = groups[i + 1].back().first - groups[i].front().first;
+        if (cost < best_cost) { best_cost = cost; best = i; }
+      }
+      groups[best].insert(groups[best].end(), groups[best + 1].begin(), groups[best + 1].end());
+      groups.erase(groups.begin() + best + 1);
+    }
+
+    wire::json_stream_writer json{out};
+    json.start_object(0);
+    json.key("chain_height");     json.unsigned_integer(std::uintmax_t(chain_height));
+    json.key("active_accounts");  json.unsigned_integer(std::uintmax_t(accounts.size()));
+    json.key("thread_count");     json.unsigned_integer(std::uintmax_t(thread_count));
+    json.key("max_group_span");   json.unsigned_integer(std::uintmax_t(max_span));
+    json.key("groups");
+    json.start_array(0);
+    for (std::size_t i = 0; i < groups.size(); ++i)
+    {
+      const auto& group = groups[i];
+      const std::uint64_t low = group.front().first;
+      const std::uint64_t high = group.back().first;
+
+      json.start_object(0);
+      json.key("thread");     json.unsigned_integer(std::uintmax_t(i));
+      json.key("accounts");   json.unsigned_integer(std::uintmax_t(group.size()));
+      json.key("low");        json.unsigned_integer(std::uintmax_t(low));
+      json.key("high");       json.unsigned_integer(std::uintmax_t(high));
+      json.key("span");       json.unsigned_integer(std::uintmax_t(high - low));
+      json.key("stalls_accounts"); json.boolean(max_span < high - low);
+      json.key("account_ids");
+      json.start_array(0);
+      for (const auto& entry : group)
+        json.unsigned_integer(std::uintmax_t(entry.second));
+      json.end_array();
+      json.end_object();
+    }
+    json.end_array();
+    json.end_object();
+    json.finish();
+  }
+
+  /*! Run the idle sweep once, by hand.
+
+    Same code path the daemon's hourly sweep uses, so an operator can see exactly
+    who would be deactivated before turning `--account-idle-days` on. */
+  void sweep_idle(program prog, std::ostream& out)
+  {
+    if (prog.arguments.size() != 1)
+      throw std::runtime_error{"sweep_idle requires <days> (0 sweeps everything not touched right now)"};
+
+    const std::uint64_t days = std::stoull(prog.arguments[0]);
+    const auto now = std::chrono::duration_cast<std::chrono::seconds>(
+      std::chrono::system_clock::now().time_since_epoch()
+    ).count();
+
+    const std::int64_t idle_seconds = std::int64_t(days) * 24 * 60 * 60;
+    if (now <= idle_seconds)
+      throw std::runtime_error{"threshold is further back than the epoch"};
+
+    const auto cutoff = lws::db::account_time(std::uint32_t(now - idle_seconds));
+    const auto swept = MONERO_UNWRAP(prog.disk.deactivate_idle(cutoff));
+
+    wire::json_stream_writer json{out};
+    json.start_object(0);
+    json.key("cutoff");       json.unsigned_integer(std::uintmax_t(lmdb::to_native(cutoff)));
+    json.key("deactivated");  json.unsigned_integer(std::uintmax_t(swept.size()));
+    json.key("addresses");
+    json.start_array(0);
+    for (auto const& address : swept)
+      json.string(lws::db::address_string(address));
+    json.end_array();
+    json.end_object();
+    json.finish();
   }
 
   void rollback(program prog, std::ostream& out)
@@ -276,16 +430,20 @@ namespace
   static constexpr const command commands[] =
   {
     {"accept_requests",       &accept_requests, "\t<\"create\"|\"import\"> <base58 address> [base 58 address]..."},
+    {"account_info",          &account_info,    "\t\t<base58 address>"},
     {"add_account",           &add_account,     "\t\t<base58 address> <view key hex>"},
     {"create_admin",          &create_admin,    ""},
     {"debug_database",        &debug_database,  ""},
+    {"delete_account",        &delete_account,  "\t<base58 address> [base 58 address]..."},
     {"list_accounts",         &list_accounts,   ""},
     {"list_admin",            &list_admin,      ""},
     {"list_requests",         &list_requests,   ""},
     {"modify_account_status", &modify_account,  "\t<\"active\"|\"inactive\"|\"hidden\"> <base58 address> [base 58 address]..."},
     {"reject_requests",       &reject_requests, "\t<\"create\"|\"import\"> <base58 address> [base 58 address]..."},
-    {"rescan",                &rescan,          "\t\t<height> <base58 address> [base 58 address]..."},
-    {"rollback",              &rollback,        "\t\t<height>"}
+    {"rescan",                &rescan,          "\t\t<height> <base58 address> [base 58 address]... (use --no-purge to keep later outputs)"},
+    {"rollback",              &rollback,        "\t\t<height>"},
+    {"scan_plan",             &scan_plan,       "\t\t[thread count]"},
+    {"sweep_idle",            &sweep_idle,      "\t\t<days> - deactivate accounts untouched for <days>"}
   };
 
   void print_help(std::ostream& out)
@@ -337,6 +495,7 @@ namespace
     };
 
     prog.show_sensitive = command_line::get_arg(args, opts.show_sensitive);
+    prog.no_purge = command_line::get_arg(args, opts.no_purge);
     auto cmd = args[opts.command.name];
     if (cmd.empty())
       throw std::runtime_error{"No command given"};

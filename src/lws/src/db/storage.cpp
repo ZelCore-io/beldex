@@ -1,9 +1,11 @@
 #include "storage.h"
 
 #include <boost/container/static_vector.hpp>
+#include <boost/optional/optional.hpp>
 #include <boost/range/adaptor/reversed.hpp>
 #include <boost/range/adaptor/transformed.hpp>
 #include <boost/range/iterator_range.hpp>
+#include <algorithm>
 #include <cassert>
 #include <chrono>
 #include <limits>
@@ -198,6 +200,14 @@ namespace db
     };
     constexpr const lmdb::basic_table<char *, unsigned> properties{
       "properties", (MDB_CREATE), &compare_string
+    };
+    /*! Last time each account's scan height moved forward.
+
+      Deliberately a separate table rather than a field on `account`: growing
+      that record would change its on-disk size and make upgrades irreversible.
+      A binary that predates this table just never opens it. */
+    constexpr const lmdb::basic_table<account_id, account_time> progress_times{
+      "account_progress_by_id", (MDB_CREATE)
     };
 
     template<typename D>
@@ -465,6 +475,18 @@ namespace db
     }
   } // anonymous
 
+  namespace
+  {
+    expect<db::account_time> get_account_time() noexcept;
+  }
+
+  /*! Bump only when an existing record layout changes.
+
+    Adding a *new* table does not need a bump: an older binary simply never
+    opens it, so the database stays readable by both. Growing a record in an
+    existing table does need one, and makes the upgrade one-way. */
+  constexpr const unsigned db_schema_version = 2;
+
   struct storage_internal : lmdb::database
   {
   // *** Add these structs for migration (based on your data.h) ***
@@ -532,6 +554,7 @@ namespace db
     MDB_dbi images;
     MDB_dbi requests;
     MDB_dbi properties;  // *** ADDED ***
+    MDB_dbi progress_times;
   } tables;
 
   const unsigned create_queue_max;
@@ -705,6 +728,7 @@ namespace db
     tables.images      = images.open(*txn).value();
     tables.requests    = requests.open(*txn).value();
     tables.properties  = properties.open(*txn).value();  // *** ADDED ***
+    tables.progress_times = progress_times.open(*txn).value();
 
     unsigned current_version = 0;
     {
@@ -724,7 +748,7 @@ namespace db
         }
     }
 
-    if (current_version < 2) {
+    if (current_version < db_schema_version) {
         expect<void> result = this->migrate(*txn, tables, current_version);
         if (!result) {
             MONERO_THROW(result.error(), "Migration failed");
@@ -774,6 +798,21 @@ namespace db
     const std::uint64_t anchor = lmdb::to_native(out.back().id);
     MINFO("Last_height_from Db : " << anchor);
     return anchor;
+  }
+
+  expect<account_time> storage_reader::get_last_progress(account_id id) noexcept
+  {
+    MONERO_PRECOND(txn != nullptr);
+    assert(db != nullptr);
+
+    MDB_val key = lmdb::to_val(id);
+    MDB_val value{};
+    const int err = mdb_get(txn.get(), db->tables.progress_times, &key, &value);
+    if (err == MDB_NOTFOUND)
+      return account_time(0); // never advanced since this was recorded
+    if (err)
+      return {lmdb::error(err)};
+    return progress_times.get_value<account_time>(value);
   }
 
   expect<lmdb::key_stream<account_status, account, cursor::close_accounts>>
@@ -1244,9 +1283,10 @@ namespace db
           MONERO_CHECK(bulk_insert(cur, blocks_version, epee::to_span(hashes)));
           if (current == chain.end())
           {
-            MINFO("last entered hash in DB : " << *current);
+            // `current` is the end iterator here - log the height, not *current
+            MINFO("last block hash stored in DB at height " << (height - 1));
             return success();
-          }           
+          }
           hashes.clear();
         }
 
@@ -1288,37 +1328,45 @@ namespace db
       cursor::blocks blocks_cur;
       MONERO_CHECK(check_cursor(txn, this->db->tables.blocks, blocks_cur));
 
-      expect<crypto::hash> hash = do_get_block_hash(*blocks_cur, height);
-
       MDB_val key{};
       MDB_val value{};
 
+      /* `hashes` starts at `height`, which the caller already holds - walk
+         forward comparing each hash we already have. The first mismatch is the
+         fork point, so roll the chain and every account back to it. */
       std::uint64_t current = std::uint64_t(height) + 1;
       auto first = hashes.begin();
       auto chain = boost::make_iterator_range(++first, hashes.end());
-      // std::cout << "hashes.size() : " << hashes.size() << std::endl;
-      // std::cout << "chain.size() : " << chain.size() << std::endl;
 
-      // for ( ; !chain.empty(); chain.advance_begin(1), ++current)
-      // {
-      //   a++;
-      //   // const int err = mdb_cursor_get(blocks_cur.get(), &key, &value, MDB_NEXT_DUP);
-      //   // if (err == MDB_NOTFOUND)
-      //   //   break;
-      //   // if (err)
-      //   //   return {lmdb::error(err)};
+      const int err = mdb_cursor_get(blocks_cur.get(), &key, &value, MDB_SET);
+      if (err && err != MDB_NOTFOUND)
+        return {lmdb::error(err)};
 
-      //   hash = blocks.get_value<MONERO_FIELD(block_info, hash)>(value);
-      //   // if (!hash)
-      //   //   return hash.error();
+      if (!err)
+      {
+        for ( ; !chain.empty(); chain.advance_begin(1), ++current)
+        {
+          const expect<crypto::hash> stored =
+            do_get_block_hash(*blocks_cur, db::block_id(current));
+          if (!stored)
+          {
+            if (stored == lmdb::error(MDB_NOTFOUND))
+              break; // past what we hold; everything from here is new
+            return stored.error();
+          }
 
-      //   // if (*hash != chain.front())
-      //   // {
-      //   //   MONERO_CHECK(rollback_chain(this->db->tables, txn, *blocks_cur, db::block_id(current)));
-      //   //   break;
-      //   // }
-      // }
-      // std::cout <<"current : " << current << std::endl;
+          if (*stored != chain.front())
+          {
+            MWARNING("Reorg detected at height " << current << " during chain sync, rolling back");
+            MONERO_CHECK(rollback_chain(this->db->tables, txn, *blocks_cur, db::block_id(current)));
+            break;
+          }
+        }
+      }
+
+      if (chain.empty())
+        return success();
+
       return append_block_hashes(*blocks_cur, db::block_id(current), chain);
     });
   }
@@ -1337,6 +1385,121 @@ namespace db
         return {lws::error::system_clock_invalid_range};
       return db::account_time(time.count());
     }
+  }
+
+  expect<void> storage::update_access_time(account_address const& address) noexcept
+  {
+    MONERO_PRECOND(db != nullptr);
+    return db->try_write([this, &address] (MDB_txn& txn) -> expect<void>
+    {
+      const expect<db::account_time> now = get_account_time();
+      if (!now)
+        return now.error();
+
+      cursor::accounts accounts_cur;
+      cursor::accounts_by_address accounts_ba_cur;
+      MONERO_CHECK(check_cursor(txn, this->db->tables.accounts, accounts_cur));
+      MONERO_CHECK(check_cursor(txn, this->db->tables.accounts_ba, accounts_ba_cur));
+
+      MDB_val key = lmdb::to_val(by_address_version);
+      MDB_val value = lmdb::to_val(address);
+      const int err = mdb_cursor_get(accounts_ba_cur.get(), &key, &value, MDB_GET_BOTH);
+      if (err == MDB_NOTFOUND)
+        return {lws::error::account_not_found};
+      if (err)
+        return {lmdb::error(err)};
+
+      const expect<account_lookup> lookup =
+        accounts_by_address.get_value<MONERO_FIELD(account_by_address, lookup)>(value);
+      if (!lookup)
+        return lookup.error();
+
+      key = lmdb::to_val(lookup->status);
+      value = lmdb::to_val(lookup->id);
+      MONERO_LMDB_CHECK(mdb_cursor_get(accounts_cur.get(), &key, &value, MDB_GET_BOTH));
+
+      expect<account> user = accounts.get_value<account>(value);
+      if (!user)
+        return user.error();
+
+      user->access = *now;
+      value = lmdb::to_val(*user);
+      MONERO_LMDB_CHECK(mdb_cursor_put(accounts_cur.get(), &key, &value, MDB_CURRENT));
+      return success();
+    });
+  }
+
+  expect<account_time> storage::access_tracking_since() noexcept
+  {
+    MONERO_PRECOND(db != nullptr);
+    return db->try_write([this] (MDB_txn& txn) -> expect<account_time>
+    {
+      static const std::string tracking_key = "access_tracking_since";
+      MDB_val key = lmdb::to_val(tracking_key);
+      MDB_val value{};
+
+      const int err = mdb_get(&txn, this->db->tables.properties, &key, &value);
+      if (!err)
+      {
+        std::uint32_t stored = 0;
+        if (value.mv_size != sizeof(stored))
+          return {lws::error::bad_blockchain};
+        std::memcpy(std::addressof(stored), value.mv_data, sizeof(stored));
+        return account_time(stored);
+      }
+      if (err != MDB_NOTFOUND)
+        return {lmdb::error(err)};
+
+      const expect<account_time> now = get_account_time();
+      if (!now)
+        return now.error();
+
+      const std::uint32_t stamp = lmdb::to_native(*now);
+      key = lmdb::to_val(tracking_key);
+      MDB_val write_value{sizeof(stamp), const_cast<std::uint32_t*>(std::addressof(stamp))};
+      MONERO_LMDB_CHECK(
+        mdb_put(&txn, this->db->tables.properties, &key, &write_value, 0)
+      );
+      return *now;
+    });
+  }
+
+  expect<std::vector<account_address>> storage::deactivate_idle(account_time cutoff)
+  {
+    MONERO_PRECOND(db != nullptr);
+
+    /* Collected under a read txn first, then handed to `change_status`, which
+       already knows how to move a record between status keys and fix up both
+       lookup indexes. */
+    std::vector<account_address> idle{};
+    {
+      expect<storage_reader> reader = this->start_read();
+      if (!reader)
+        return reader.error();
+
+      auto active = reader->get_accounts(account_status::active);
+      if (!active)
+      {
+        if (active == lmdb::error(MDB_NOTFOUND))
+          return std::vector<account_address>{};
+        return active.error();
+      }
+
+      for (account const& user : active->make_range())
+      {
+        // never sweep admin accounts, whatever their access time
+        if (user.flags & account_flags::admin_account)
+          continue;
+        if (lmdb::to_native(user.access) < lmdb::to_native(cutoff))
+          idle.push_back(user.address);
+      }
+      reader->finish_read();
+    }
+
+    if (idle.empty())
+      return std::vector<account_address>{};
+
+    return change_status(account_status::inactive, epee::to_span(idle));
   }
 
    expect<std::vector<account_address>>
@@ -1460,7 +1623,9 @@ namespace db
   {
     //! \return Success, even if `address` was not found (designed for
     expect<void>
-    change_height(MDB_cursor& accounts_cur, MDB_cursor& accounts_ba_cur, MDB_cursor& accounts_bh_cur, block_id height, account_address const& address)
+    change_height(MDB_cursor& accounts_cur, MDB_cursor& accounts_ba_cur, MDB_cursor& accounts_bh_cur,
+                  MDB_cursor& outputs_cur, MDB_cursor& spends_cur, MDB_cursor& images_cur,
+                  block_id height, account_address const& address, bool purge)
     {
       MDB_val key = lmdb::to_val(by_address_version);
       MDB_val value = lmdb::to_val(address);
@@ -1486,8 +1651,23 @@ namespace db
         return user.error();
 
       const block_id current_height = user->scan_height;
-      user->scan_height = std::min(height, user->scan_height);
+
+      /* Move the account to exactly `height`, in whichever direction that is.
+         The old behaviour was `min(height, scan_height)`, which meant an account
+         could only ever be moved backwards - there was no way to skip a stuck
+         account forward past a range it does not care about. */
+      user->scan_height = height;
       user->start_height = std::min(height, user->start_height);
+
+      /* Anything recorded above the new height describes blocks the account has
+         not scanned any more, so it has to go. Without this a rescan can only
+         ever re-confirm what is already stored and can never repair a wrong
+         balance, which is the usual reason to run one. */
+      if (purge && height < current_height)
+      {
+        MONERO_CHECK(rollback_outputs(user->id, block_id(std::uint64_t(height) + 1), outputs_cur));
+        MONERO_CHECK(rollback_spends(user->id, block_id(std::uint64_t(height) + 1), spends_cur, images_cur));
+      }
 
       value = lmdb::to_val(*user);
       MONERO_LMDB_CHECK(
@@ -1511,44 +1691,63 @@ namespace db
   }
 
   expect<std::vector<account_address>>
-  storage::rescan(db::block_id height, epee::span<const account_address> addresses)
+  storage::rescan(db::block_id height, epee::span<const account_address> addresses, bool purge, std::uint64_t chain_height)
   {
     MONERO_PRECOND(db != nullptr);
-    return db->try_write([this, height, addresses] (MDB_txn& txn) -> expect<std::vector<account_address>>
+    return db->try_write([this, height, addresses, purge, chain_height] (MDB_txn& txn) -> expect<std::vector<account_address>>
     {
+      /* Bound against the live chain tip when the caller knows it. The local
+         chain table only advances during a sync pass, so using it alone rejected
+         perfectly valid heights. Fall back to the table when no tip was given. */
       {
-        cursor::blocks blocks_cur;
-        MONERO_CHECK(check_cursor(txn, this->db->tables.blocks, blocks_cur));
+        std::uint64_t limit = chain_height;
+        if (!limit)
+        {
+          cursor::blocks blocks_cur;
+          MONERO_CHECK(check_cursor(txn, this->db->tables.blocks, blocks_cur));
 
-        MDB_val key = lmdb::to_val(blocks_version);
-        MDB_val value{};
+          MDB_val key = lmdb::to_val(blocks_version);
+          MDB_val value{};
 
-        MONERO_LMDB_CHECK(mdb_cursor_get(blocks_cur.get(), &key, &value, MDB_SET));
-        MONERO_LMDB_CHECK(mdb_cursor_get(blocks_cur.get(), &key, &value, MDB_LAST_DUP));
-
-        const expect<block_id> current_height =
-          blocks.get_value<MONERO_FIELD(block_info, id)>(value);
-        if (!current_height)
-          return current_height.error();
-        if (*current_height < height)
+          const int err = mdb_cursor_get(blocks_cur.get(), &key, &value, MDB_SET);
+          if (err && err != MDB_NOTFOUND)
+            return {lmdb::error(err)};
+          if (!err)
+          {
+            MONERO_LMDB_CHECK(mdb_cursor_get(blocks_cur.get(), &key, &value, MDB_LAST_DUP));
+            const expect<block_id> current_height =
+              blocks.get_value<MONERO_FIELD(block_info, id)>(value);
+            if (!current_height)
+              return current_height.error();
+            limit = lmdb::to_native(*current_height);
+          }
+        }
+        if (limit && limit < lmdb::to_native(height))
           return {error::bad_height};
       }
-      
+
       std::vector<account_address> updated{};
       updated.reserve(addresses.size());
 
       cursor::accounts accounts_cur;
       cursor::accounts_by_address accounts_ba_cur;
       cursor::accounts_by_height accounts_bh_cur;
+      cursor::outputs outputs_cur;
+      cursor::spends spends_cur;
+      cursor::images images_cur;
 
       MONERO_CHECK(check_cursor(txn, this->db->tables.accounts, accounts_cur));
       MONERO_CHECK(check_cursor(txn, this->db->tables.accounts_ba, accounts_ba_cur));
       MONERO_CHECK(check_cursor(txn, this->db->tables.accounts_bh, accounts_bh_cur));
+      MONERO_CHECK(check_cursor(txn, this->db->tables.outputs, outputs_cur));
+      MONERO_CHECK(check_cursor(txn, this->db->tables.spends, spends_cur));
+      MONERO_CHECK(check_cursor(txn, this->db->tables.images, images_cur));
 
       for (account_address const& address : addresses)
       {
         const expect<void> changed = change_height(
-          *accounts_cur, *accounts_ba_cur, *accounts_bh_cur, height, address
+          *accounts_cur, *accounts_ba_cur, *accounts_bh_cur,
+          *outputs_cur, *spends_cur, *images_cur, height, address, purge
         );
         if (changed)
           updated.push_back(address);
@@ -1556,6 +1755,80 @@ namespace db
           return changed.error();
       }
       return updated;
+    });
+  }
+
+  expect<std::vector<account_address>>
+  storage::delete_accounts(epee::span<const account_address> addresses)
+  {
+    MONERO_PRECOND(db != nullptr);
+    return db->try_write([this, addresses] (MDB_txn& txn) -> expect<std::vector<account_address>>
+    {
+      std::vector<account_address> removed{};
+      removed.reserve(addresses.size());
+
+      cursor::accounts accounts_cur;
+      cursor::accounts_by_address accounts_ba_cur;
+      cursor::accounts_by_height accounts_bh_cur;
+      cursor::outputs outputs_cur;
+      cursor::spends spends_cur;
+      cursor::images images_cur;
+
+      MONERO_CHECK(check_cursor(txn, this->db->tables.accounts, accounts_cur));
+      MONERO_CHECK(check_cursor(txn, this->db->tables.accounts_ba, accounts_ba_cur));
+      MONERO_CHECK(check_cursor(txn, this->db->tables.accounts_bh, accounts_bh_cur));
+      MONERO_CHECK(check_cursor(txn, this->db->tables.outputs, outputs_cur));
+      MONERO_CHECK(check_cursor(txn, this->db->tables.spends, spends_cur));
+      MONERO_CHECK(check_cursor(txn, this->db->tables.images, images_cur));
+
+      for (account_address const& address : addresses)
+      {
+        MDB_val key = lmdb::to_val(by_address_version);
+        MDB_val value = lmdb::to_val(address);
+        int err = mdb_cursor_get(accounts_ba_cur.get(), &key, &value, MDB_GET_BOTH);
+        if (err == MDB_NOTFOUND)
+          continue; // to next address
+        if (err)
+          return {lmdb::error(err)};
+
+        const expect<account_lookup> lookup =
+          accounts_by_address.get_value<MONERO_FIELD(account_by_address, lookup)>(value);
+        if (!lookup)
+          return lookup.error();
+
+        // drop the address index entry we are standing on
+        MONERO_LMDB_CHECK(mdb_cursor_del(accounts_ba_cur.get(), 0));
+
+        key = lmdb::to_val(lookup->status);
+        value = lmdb::to_val(lookup->id);
+        MONERO_LMDB_CHECK(mdb_cursor_get(accounts_cur.get(), &key, &value, MDB_GET_BOTH));
+
+        const expect<account> user = accounts.get_value<account>(value);
+        if (!user)
+          return user.error();
+
+        // everything indexed against the account, from height 0 upwards
+        MONERO_CHECK(rollback_outputs(user->id, block_id(0), *outputs_cur));
+        MONERO_CHECK(rollback_spends(user->id, block_id(0), *spends_cur, *images_cur));
+
+        // by-height index entry
+        key = lmdb::to_val(user->scan_height);
+        value = lmdb::to_val(user->id);
+        err = mdb_cursor_get(accounts_bh_cur.get(), &key, &value, MDB_GET_BOTH);
+        if (!err)
+          MONERO_LMDB_CHECK(mdb_cursor_del(accounts_bh_cur.get(), 0));
+        else if (err != MDB_NOTFOUND)
+          return {lmdb::error(err)};
+
+        // and finally the account record itself
+        key = lmdb::to_val(lookup->status);
+        value = lmdb::to_val(lookup->id);
+        MONERO_LMDB_CHECK(mdb_cursor_get(accounts_cur.get(), &key, &value, MDB_GET_BOTH));
+        MONERO_LMDB_CHECK(mdb_cursor_del(accounts_cur.get(), 0));
+
+        removed.push_back(address);
+      }
+      return removed;
     });
   }
 
@@ -1762,11 +2035,17 @@ namespace db
       cursor::accounts accounts_ba_cur;
       cursor::accounts accounts_bh_cur;
       cursor::requests requests_cur;
+      cursor::outputs outputs_cur;
+      cursor::spends spends_cur;
+      cursor::images images_cur;
 
       MONERO_CHECK(check_cursor(txn, tables.accounts, accounts_cur));
       MONERO_CHECK(check_cursor(txn, tables.accounts_ba, accounts_ba_cur));
       MONERO_CHECK(check_cursor(txn, tables.accounts_bh, accounts_bh_cur));
       MONERO_CHECK(check_cursor(txn, tables.requests, requests_cur));
+      MONERO_CHECK(check_cursor(txn, tables.outputs, outputs_cur));
+      MONERO_CHECK(check_cursor(txn, tables.spends, spends_cur));
+      MONERO_CHECK(check_cursor(txn, tables.images, images_cur));
 
       const request req = request::import_scan;
       for (account_address const& address : addresses)
@@ -1785,8 +2064,10 @@ namespace db
         if (!new_height)
           return new_height.error();
 
+        // an approved import rescans from `new_height`, so purge above it
         const expect<void> changed = change_height(
-          *accounts_cur, *accounts_ba_cur, *accounts_bh_cur, *new_height, address
+          *accounts_cur, *accounts_ba_cur, *accounts_bh_cur,
+          *outputs_cur, *spends_cur, *images_cur, *new_height, address, true
         );
         if (changed)
           updated.push_back(address);
@@ -1879,13 +2160,22 @@ namespace db
       MDB_val keyv = lmdb::to_val(blocks_version);
       MDB_val value{};
 
-      MONERO_LMDB_CHECK(mdb_cursor_get(blocks_cur.get(), &keyv, &value, MDB_SET));
-      MONERO_LMDB_CHECK(mdb_cursor_get(blocks_cur.get(), &keyv, &value, MDB_LAST_DUP));
-
-      const expect<block_id> height =
-        blocks.get_value<MONERO_FIELD(block_info, id)>(value);
-      if (!height)
-        return height.error();
+      /* On a database that has never synced, the chain table is empty. Start the
+         account at height 0 rather than refusing to create it - otherwise no
+         account can be added until the first chain sync finishes. */
+      block_id start = block_id(0);
+      int chain_err = mdb_cursor_get(blocks_cur.get(), &keyv, &value, MDB_SET);
+      if (!chain_err)
+      {
+        MONERO_LMDB_CHECK(mdb_cursor_get(blocks_cur.get(), &keyv, &value, MDB_LAST_DUP));
+        const expect<block_id> height =
+          blocks.get_value<MONERO_FIELD(block_info, id)>(value);
+        if (!height)
+          return height.error();
+        start = *height;
+      }
+      else if (chain_err != MDB_NOTFOUND)
+        return {lmdb::error(chain_err)};
 
       const account_id next_id = account_id(lmdb::to_native(*last_id) + 1);
       account user{};
@@ -1893,8 +2183,8 @@ namespace db
       user.address = address;
       static_assert(sizeof(user.key) == sizeof(key), "bad memcpy");
       std::memcpy(std::addressof(user.key), std::addressof(key), sizeof(key));
-      user.start_height = *height;
-      user.scan_height = *height;
+      user.start_height = start;
+      user.scan_height = start;
       user.access = *current_time;
       user.creation = *current_time;
       user.flags = flags;
@@ -1925,57 +2215,93 @@ namespace db
     }
   } // anonymous
 
-  expect<std::size_t> storage::update(block_id height, epee::span<const crypto::hash> chain, epee::span<const lws::account> users)
+  expect<update_outcome> storage::update(block_id height, epee::span<const crypto::hash> chain, epee::span<const lws::account> users)
   {
-    //  std::cout << " in updated function " << std::endl;
     if (users.empty() && chain.empty())
-      return 0;
+      return update_outcome{};
 
     MONERO_PRECOND(!chain.empty());
     MONERO_PRECOND(db != nullptr);
 
-    return db->try_write([this, height, chain, users] (MDB_txn& txn) -> expect<std::size_t>
+    return db->try_write([this, height, chain, users] (MDB_txn& txn) -> expect<update_outcome>
     {
-      // std::cout << " in try_write function " << std::endl;
+      /* The height this batch reached. Note that it is derived from the *first*
+         account in the group, so it can legitimately be behind an account that
+         is already further along - see the `last_update <= existing` branch
+         below, which is why a stored height is never lowered here. */
       epee::span<const crypto::hash> chain_copy{chain};
       const std::uint64_t last_update =
         lmdb::to_native(height) + chain.size() - 1;
 
-      // if (get_checkpoints().get_max_height() <= last_update)
-      // {
-      //   cursor::blocks blocks_cur;
-      //   MONERO_CHECK(check_cursor(txn, this->db->tables.blocks, blocks_cur));
+      /* Reorg check. Compare the hashes this batch scanned against what the
+         chain table already holds; a mismatch means the blocks these accounts
+         were scanned against are no longer on the chain, so the caller must roll
+         back rather than commit. Extend the chain table with what we scanned so
+         the next batch has something to check against. */
+      {
+        cursor::blocks blocks_cur;
+        MONERO_CHECK(check_cursor(txn, this->db->tables.blocks, blocks_cur));
 
-      //   MDB_val key = lmdb::to_val(blocks_version);
-      //   MDB_val value;
-      //   MONERO_LMDB_CHECK(mdb_cursor_get(blocks_cur.get(), &key, &value, MDB_SET));
-      //   MONERO_LMDB_CHECK(mdb_cursor_get(blocks_cur.get(), &key, &value, MDB_LAST_DUP));
+        MDB_val key = lmdb::to_val(blocks_version);
+        MDB_val value{};
+        const int err = mdb_cursor_get(blocks_cur.get(), &key, &value, MDB_SET);
+        if (err && err != MDB_NOTFOUND)
+          return {lmdb::error(err)};
 
-      //   const expect<block_info> last_block = blocks.get_value<block_info>(value);
-      //   if (!last_block)
-      //     return last_block.error();
-      //   if (last_block->id < height)
-      //     return {lws::error::bad_blockchain};
+        if (!err)
+        {
+          MONERO_LMDB_CHECK(mdb_cursor_get(blocks_cur.get(), &key, &value, MDB_LAST_DUP));
+          const expect<block_info> last_block = blocks.get_value<block_info>(value);
+          if (!last_block)
+            return last_block.error();
 
-      //   const std::uint64_t last_same =
-      //     std::min(lmdb::to_native(last_block->id), last_update);
+          if (lmdb::to_native(last_block->id) < lmdb::to_native(height))
+          {
+            /* Gap between the chain table and this batch. Nothing to compare, so
+               just append from `height` onwards. */
+            MONERO_CHECK(append_block_hashes(*blocks_cur, height, chain_copy));
+          }
+          else
+          {
+            const std::uint64_t last_same =
+              std::min(lmdb::to_native(last_block->id), last_update);
+            const std::uint64_t offset = last_same - lmdb::to_native(height);
 
-      //   const expect<crypto::hash> hash_check =
-      //     do_get_block_hash(*blocks_cur, block_id(last_same));
-      //   if (!hash_check)
-      //     return hash_check.error();
+            /* Threads scan disjoint height ranges, so the chain table can have
+               gaps. A height we simply do not hold is not a reorg - there is
+               just nothing to compare against, so record what we scanned. */
+            const expect<crypto::hash> stored =
+              do_get_block_hash(*blocks_cur, block_id(last_same));
 
-      //   const std::uint64_t offset = last_same - lmdb::to_native(height);
-      //   if (*hash_check != *(chain_copy.begin() + offset))
-      //     return {lws::error::blockchain_reorg};
+            if (!stored)
+            {
+              if (stored != lmdb::error(MDB_NOTFOUND))
+                return stored.error();
+              MONERO_CHECK(append_block_hashes(*blocks_cur, height, chain_copy));
+            }
+            else
+            {
+              if (*stored != *(chain_copy.begin() + offset))
+                return {lws::error::blockchain_reorg};
 
-      //   chain_copy.remove_prefix(offset + 1);
-      //   MONERO_CHECK(
-      //     append_block_hashes(
-      //       *blocks_cur, block_id(lmdb::to_native(height) + offset + 1), chain_copy
-      //     )
-      //   );
-      // }
+              chain_copy.remove_prefix(offset + 1);
+              if (!chain_copy.empty())
+              {
+                MONERO_CHECK(
+                  append_block_hashes(
+                    *blocks_cur, block_id(lmdb::to_native(height) + offset + 1), chain_copy
+                  )
+                );
+              }
+            }
+          }
+        }
+        else
+        {
+          // empty chain table (never synced) - seed it with what we just scanned
+          MONERO_CHECK(append_block_hashes(*blocks_cur, height, chain_copy));
+        }
+      }
 
       cursor::accounts            accounts_cur;
       cursor::accounts_by_address accounts_ba_cur;
@@ -1989,15 +2315,16 @@ namespace db
       MONERO_CHECK(check_cursor(txn, this->db->tables.outputs, outputs_cur));
       MONERO_CHECK(check_cursor(txn, this->db->tables.spends, spends_cur));
       MONERO_CHECK(check_cursor(txn, this->db->tables.images, images_cur));
-      // std::cout << " in check_cursor function " << std::endl;
-      // for bulk inserts
+
+      update_outcome out{};
+      out.advanced.reserve(users.size());
+
+      // for bulk inserts into the by-height index; every entry lands on `last_update`
       boost::container::static_vector<account_lookup, 127> heights{};
       static_assert(sizeof(heights) <= 1024, "stack vector is large");
 
-      std::size_t updated = 0;
       for (auto user = users.begin() ;; ++user)
       {
-        // std::cout << " in user function " << std::endl;
         if (heights.size() == heights.capacity() || user == users.end())
         {
           // bulk update account height index
@@ -2029,6 +2356,7 @@ namespace db
           {
             if (err != MDB_NOTFOUND)
               return {lmdb::error(err)};
+            out.diverged.push_back(user_id); // account record has gone away
             continue; // to next account
           }
 
@@ -2040,30 +2368,77 @@ namespace db
           status_key = lookup->status;
           MONERO_LMDB_CHECK(mdb_cursor_get(accounts_cur.get(), &key, &value, MDB_GET_BOTH));
         }
+
         expect<account> existing = accounts.get_value<account>(value);
         if (!existing || existing->scan_height != user->scan_height())
+        {
+          /* The stored height moved underneath us - an admin rescan, a rollback,
+             or another thread also holding this account. Leave it alone; the
+             caller re-reads from disk and re-plans. */
+          out.diverged.push_back(user_id);
           continue; // to next account
+        }
 
         const block_id existing_height = existing->scan_height;
+
+        /* Never lower a scan height. `last_update` describes where *this thread*
+           got to, which is not necessarily where this account got to. Lowering
+           it would silently discard scan progress and make the account report
+           confirmed outputs as locked. */
+        if (last_update <= lmdb::to_native(existing_height))
+        {
+          if (last_update < lmdb::to_native(existing_height))
+          {
+            out.regressions.push_back(
+              account_progress{user_id, existing_height, block_id(last_update)}
+            );
+          }
+          out.unchanged.push_back(
+            account_progress{user_id, existing_height, existing_height}
+          );
+
+          /* Still persist anything the scan found for this account. The spans
+             are empty whenever the account was skipped for being ahead of the
+             batch, so this is a no-op in the common case. */
+          MONERO_CHECK(bulk_insert(*outputs_cur, user_id, epee::to_span(user->outputs())));
+          MONERO_CHECK(add_spends(*spends_cur, *images_cur, user_id, epee::to_span(user->spends())));
+          continue; // to next account
+        }
 
         existing->scan_height = block_id(last_update);
         value = lmdb::to_val(*existing);
         MONERO_LMDB_CHECK(mdb_cursor_put(accounts_cur.get(), &key, &value, MDB_CURRENT));
 
-        heights.push_back(account_lookup{user->id(), status_key});
+        heights.push_back(account_lookup{user_id, status_key});
 
         key = lmdb::to_val(existing_height);
         value = lmdb::to_val(user_id);
         MONERO_LMDB_CHECK(mdb_cursor_get(accounts_bh_cur.get(), &key, &value, MDB_GET_BOTH));
         MONERO_LMDB_CHECK(mdb_cursor_del(accounts_bh_cur.get(), 0));
 
-        MONERO_CHECK(bulk_insert(*outputs_cur, user->id(), epee::to_span(user->outputs())));
-        MONERO_CHECK(add_spends(*spends_cur, *images_cur, user->id(), epee::to_span(user->spends())));
+        MONERO_CHECK(bulk_insert(*outputs_cur, user_id, epee::to_span(user->outputs())));
+        MONERO_CHECK(add_spends(*spends_cur, *images_cur, user_id, epee::to_span(user->spends())));
 
-        ++updated;
+        /* Stamped only on real forward movement, in a side table so that the
+           account record's on-disk size never changes. */
+        {
+          const expect<db::account_time> now = get_account_time();
+          if (now)
+          {
+            MDB_val progress_key = lmdb::to_val(user_id);
+            MDB_val progress_value = lmdb::to_val(*now);
+            MONERO_LMDB_CHECK(
+              mdb_put(&txn, this->db->tables.progress_times, &progress_key, &progress_value, 0)
+            );
+          }
+        }
+
+        out.advanced.push_back(
+          account_progress{user_id, existing_height, block_id(last_update)}
+        );
       } // ... for every account being updated ...
-      // std::cout << " in updated function " << std::endl;
-      return updated;
+
+      return out;
     });
   }
 } //db

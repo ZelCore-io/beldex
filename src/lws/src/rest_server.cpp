@@ -1,5 +1,11 @@
 #include "rest_server.h"
 
+#include <ctime>
+#include "scanner.h"
+#include <sstream>
+#include <unordered_map>
+#include <unordered_set>
+
 #include <algorithm>
 #include <boost/utility/string_ref.hpp>
 #include <chrono>
@@ -30,9 +36,66 @@
 #include "wire/crypto.h"
 #include "rpc/light_wallet.h"
 #include "wire/json.h"
+#include "wire/vector.h"
 #include "config.h"
 namespace lws
 {
+  void write_bytes(wire::json_writer& dest, const scan_thread_status& self)
+  {
+    std::vector<std::uint64_t> accounts{};
+    accounts.reserve(self.accounts.size());
+    for (const db::account_id id : self.accounts)
+      accounts.push_back(lmdb::to_native(id));
+
+    wire::object(dest,
+      wire::field("index", self.index),
+      wire::field("alive", self.alive),
+      wire::field("accounts", std::move(accounts)),
+      wire::field("group_low", self.group_low),
+      wire::field("group_high", self.group_high),
+      wire::field("group_span", std::uint64_t(self.group_high - self.group_low)),
+      wire::field("current_height", self.current_height),
+      wire::field("blocks_scanned", self.blocks_scanned),
+      wire::field("blocks_per_second", std::uint64_t(self.blocks_per_second)),
+      wire::field("last_batch_ms", self.last_batch_ms),
+      wire::field("last_commit", self.last_commit),
+      wire::field("seconds_since_commit",
+        self.last_commit ? std::int64_t(std::time(nullptr)) - self.last_commit : std::int64_t(-1)),
+      wire::field("consecutive_failures", std::uint64_t(self.consecutive_failures)),
+      wire::field("last_error", std::cref(self.last_error))
+    );
+  }
+
+  void write_bytes(wire::json_writer& dest, const scanner_status& self)
+  {
+    std::uint64_t lowest = 0;
+    bool have_lowest = false;
+    for (const auto& thread : self.threads)
+    {
+      if (!thread.alive)
+        continue;
+      if (!have_lowest || thread.current_height < lowest)
+      {
+        lowest = thread.current_height;
+        have_lowest = true;
+      }
+    }
+
+    wire::object(dest,
+      wire::field("running", self.running),
+      wire::field("daemon_height", self.daemon_height),
+      wire::field("lowest_scan_height", lowest),
+      wire::field("blocks_behind",
+        (self.daemon_height > lowest) ? self.daemon_height - lowest : std::uint64_t(0)),
+      wire::field("restarts", self.restarts),
+      wire::field("accounts_deactivated", self.deactivated),
+      wire::field("last_sweep", self.last_sweep),
+      wire::field("last_restart", self.last_restart),
+      wire::field("last_restart_reason", std::cref(self.last_restart_reason)),
+      wire::field("threads", std::cref(self.threads))
+    );
+  }
+
   namespace
   {
     namespace http = epee::net_utils::http;
@@ -56,6 +119,17 @@ namespace lws
         break;
       }
       return true;
+    }
+
+    /*! \return The best known chain tip.
+
+      The local `blocks` table only reflects what the scanner has committed, so
+      on its own it under-reports the tip to wallets. The scanner also records
+      the `current_height` the daemon reported on its last batch; take whichever
+      is further along. */
+    std::uint64_t best_chain_height(const db::block_info& last) noexcept
+    {
+      return std::max(std::uint64_t(last.id), lws::scanner::status().daemon_height);
     }
 
     bool is_locked(std::uint64_t unlock_time, db::block_id last) noexcept
@@ -126,11 +200,132 @@ namespace lws
       }
     }
 
+    /*! Master node lock data, indexed for lookup.
+
+      The wallet endpoints below need to answer "is this output locked into a
+      master node?" once per output. Walking the blacklist and then every
+      contributor of every master node for each output made those endpoints
+      quadratic in the size of the node list; these maps are built once per cache
+      refresh instead. */
     struct master_node_cache
     {
       json master_nodes;
       json blacklist;
+
+      //! Blacklisted key image -> locked amount.
+      std::unordered_map<crypto::key_image, std::uint64_t> blacklisted;
+      //! Wallet address -> its locked contributions, keyed by key image.
+      std::unordered_map<
+        std::string, std::unordered_map<crypto::key_image, std::uint64_t>
+      > locked_contributions;
+
+      //! \return The contribution locked against `image` for `address`, if any.
+      boost::optional<std::uint64_t>
+      contribution_amount(const std::string& address, const crypto::key_image& image) const
+      {
+        const auto by_address = locked_contributions.find(address);
+        if (by_address == locked_contributions.end())
+          return boost::none;
+
+        const auto contribution = by_address->second.find(image);
+        if (contribution == by_address->second.end())
+          return boost::none;
+        return contribution->second;
+      }
+
+      /*! \return The amount locked against `image` for `address`, or nothing.
+          Blacklist first, matching the original ordering. */
+      boost::optional<std::uint64_t>
+      locked_amount(const std::string& address, const crypto::key_image& image) const
+      {
+        const auto blacklisted_entry = blacklisted.find(image);
+        if (blacklisted_entry != blacklisted.end())
+          return blacklisted_entry->second;
+        return contribution_amount(address, image);
+      }
+
+      /*! \return True if `image` is locked for exactly `amount`.
+
+          Both sources are checked independently rather than short-circuiting on
+          the blacklist, because the original code fell through to the
+          contributor list whenever the blacklisted amount did not match. */
+      bool locks_exactly(const std::string& address, const crypto::key_image& image, std::uint64_t amount) const
+      {
+        const auto blacklisted_entry = blacklisted.find(image);
+        if (blacklisted_entry != blacklisted.end() && blacklisted_entry->second == amount)
+          return true;
+
+        const auto contribution = contribution_amount(address, image);
+        return bool(contribution) && *contribution == amount;
+      }
     };
+
+    //! Populate the lookup maps in `cache` from its freshly fetched JSON.
+    void index_master_node_cache(master_node_cache& cache)
+    {
+      cache.blacklisted.clear();
+      cache.locked_contributions.clear();
+
+      const auto blacklist = cache.blacklist.find("result");
+      if (blacklist != cache.blacklist.end())
+      {
+        const auto entries = blacklist->find("blacklist");
+        if (entries != blacklist->end() && entries->is_array())
+        {
+          for (const auto& entry : *entries)
+          {
+            crypto::key_image image{};
+            const auto image_hex = entry.find("key_image");
+            const auto amount = entry.find("amount");
+            if (image_hex == entry.end() || amount == entry.end())
+              continue;
+            if (!tools::hex_to_type(image_hex->get<std::string>(), image))
+            {
+              MWARNING("Skipping unparseable blacklist key image");
+              continue;
+            }
+            cache.blacklisted.emplace(image, amount->get<std::uint64_t>());
+          }
+        }
+      }
+
+      const auto nodes = cache.master_nodes.find("result");
+      if (nodes == cache.master_nodes.end())
+        return;
+      const auto states = nodes->find("master_node_states");
+      if (states == nodes->end() || !states->is_array())
+        return;
+
+      for (const auto& node : *states)
+      {
+        const auto contributors = node.find("contributors");
+        if (contributors == node.end() || !contributors->is_array())
+          continue;
+
+        for (const auto& contributor : *contributors)
+        {
+          const auto address = contributor.find("address");
+          const auto contributions = contributor.find("locked_contributions");
+          if (address == contributor.end() || contributions == contributor.end())
+            continue;
+          if (!contributions->is_array())
+            continue;
+
+          auto& by_image = cache.locked_contributions[address->get<std::string>()];
+          for (const auto& contribution : *contributions)
+          {
+            crypto::key_image image{};
+            const auto image_hex = contribution.find("key_image");
+            const auto amount = contribution.find("amount");
+            if (image_hex == contribution.end() || amount == contribution.end())
+              continue;
+            if (!tools::hex_to_type(image_hex->get<std::string>(), image))
+              continue;
+            by_image.emplace(image, amount->get<std::uint64_t>());
+          }
+        }
+      }
+    }
 
     expect<master_node_cache> get_master_node_cache()
     {
@@ -166,11 +361,62 @@ namespace lws
       else
         cache.blacklist = std::move(*blacklist);
 
+      index_master_node_cache(cache);
+
       last_update = std::chrono::steady_clock::now();
       cache_initialized = true;
       return cache;
     }
 
+
+    /*! Rate limiter for `access` timestamp writes.
+
+      Wallets poll `get_address_info` continuously, and every bump takes the
+      single LMDB write lock that the scanner needs to commit batches. One write
+      per account per `access_write_interval` is plenty to drive a sweep measured
+      in days. */
+    class access_tracker
+    {
+      static constexpr const std::chrono::minutes access_write_interval{15};
+
+      std::mutex mutex_{};
+      std::unordered_map<std::uint32_t, std::chrono::steady_clock::time_point> last_{};
+
+    public:
+      //! \return True if `id` is due a write, marking it written.
+      bool claim(db::account_id id)
+      {
+        const auto now = std::chrono::steady_clock::now();
+        const std::uint32_t key = lmdb::to_native(id);
+
+        const std::lock_guard<std::mutex> lock{mutex_};
+        const auto existing = last_.find(key);
+        if (existing != last_.end() && now - existing->second < access_write_interval)
+          return false;
+        last_[key] = now;
+        return true;
+      }
+    };
+
+    access_tracker& access_writes()
+    {
+      static access_tracker instance{};
+      return instance;
+    }
+
+    /*! Record that `user` was just used, at most once per debounce window.
+
+      Failures are logged and swallowed: a missed access stamp delays a sweep,
+      it must never fail a wallet request. */
+    void note_account_access(db::storage& disk, db::account const& user)
+    {
+      if (!access_writes().claim(user.id))
+        return;
+      const expect<void> updated = disk.update_access_time(user.address);
+      if (!updated)
+        MWARNING("Failed to record access time for account "
+          << lmdb::to_native(user.id) << ": " << updated.error().message());
+    }
 
     //! \return Account info from the DB, iff key matches address AND address is NOT hidden.
     expect<std::pair<db::account, db::storage_reader>> open_account(const rpc::account_credentials& creds, db::storage disk)
@@ -282,11 +528,13 @@ namespace lws
 
       static expect<response> handle(const request &req, db::storage disk)
       {
-        auto user = open_account(req, std::move(disk));
+        auto user = open_account(req, disk.clone());
         if (!user)
           return user.error();
 
-        std::vector<crypto::key_image> processed;
+        note_account_access(disk, user->first);
+
+        std::unordered_set<crypto::key_image> processed;
 
         lws::db::account_address primary_address{req.address.view_public, req.address.spend_public};
         cryptonote::account_public_address crypto_address;
@@ -313,7 +561,7 @@ namespace lws
         if (!last)
           return last.error();
 
-        resp.blockchain_height = std::uint64_t(last->id);
+        resp.blockchain_height = best_chain_height(*last);
         resp.transaction_height = resp.blockchain_height;
         resp.scanned_height = std::uint64_t(user->first.scan_height);
         resp.scanned_block_height = resp.scanned_height;
@@ -338,67 +586,23 @@ namespace lws
           const crypto::key_image locked_key_image =
               output.get_value<MONERO_FIELD(db::output, locked_key_image)>();
 
-          auto it = std::find(processed.begin(), processed.end(), locked_key_image);
-          bool matched_master_node_lock = false;
-
-          if (!(it != processed.end()) && locked_key_image != crypto::key_image{})
+          if (locked_key_image != crypto::key_image{} && !processed.count(locked_key_image))
           {
-            for (const auto &item : (*master_node_data).blacklist["result"]["blacklist"])
+            const auto locked =
+              master_node_data->locked_amount(wallet_address, locked_key_image);
+            if (locked)
             {
-              std::string blacklist_key_image_str = item["key_image"];
-              crypto::key_image blacklist_key_image;
-
-              if (!epee::string_tools::hex_to_pod(blacklist_key_image_str, blacklist_key_image))
-              {
-                MWARNING("Failed to convert blacklist key image string to crypto::key_image");
-                continue;
-              }
-
-              if (locked_key_image == blacklist_key_image)
-              {
-                
-                resp.locked_funds = rpc::safe_uint64(std::uint64_t(resp.locked_funds) + std::uint64_t(item["amount"]));
-                processed.push_back(locked_key_image);
-                matched_master_node_lock = true;
-                break;
-              }
-            }
-
-            if (!matched_master_node_lock)
-            {
-              for (auto &mn_all : (*master_node_data).master_nodes["result"]["master_node_states"])
-              {
-                for (auto &mn_contrib : mn_all["contributors"])
-                {
-                  std::string address_str = mn_contrib["address"].get<std::string>();
-
-                  if (wallet_address != address_str)
-                    continue;
-
-                  for (auto const &contribution : mn_contrib["locked_contributions"])
-                  {
-                    crypto::key_image check_image;
-                    std::string key_image_str = contribution["key_image"].get<std::string>();
-                    if (tools::hex_to_type(key_image_str, check_image) && locked_key_image == check_image)
-                    {
-                      resp.locked_funds = rpc::safe_uint64(std::uint64_t(resp.locked_funds) + std::uint64_t(contribution["amount"]));
-                      processed.push_back(locked_key_image);
-                      matched_master_node_lock = true;
-                      break;
-                    }
-                  }
-
-                  if (matched_master_node_lock)
-                    break;
-                }
-
-                if (matched_master_node_lock)
-                  break;
-              }
+              resp.locked_funds =
+                rpc::safe_uint64(std::uint64_t(resp.locked_funds) + *locked);
+              processed.insert(locked_key_image);
             }
           }
 
-          if (is_locked(output.get_value<MONERO_FIELD(db::output, unlock_time)>(), user->first.scan_height))
+          /* Compare the unlock time against the chain tip, not against how far
+             this account happens to have scanned. Using scan_height made a
+             lagging account report already-spendable outputs as locked, so funds
+             appeared to vanish into "pending" while it caught up. */
+          if (is_locked(output.get_value<MONERO_FIELD(db::output, unlock_time)>(), db::block_id(resp.blockchain_height)))
           {
             resp.locked_funds = rpc::safe_uint64(std::uint64_t(resp.locked_funds) + meta.amount);
           }
@@ -479,62 +683,14 @@ namespace lws
           if (out.spend_meta.amount < std::uint64_t(*req.dust_threshold) ||  (out.spend_meta.mixin_count < *req.mixin && !(coinbase == 1)))
             continue;
           
-          bool should_skip_output = false;
           const std::uint64_t value_l = out.spend_meta.amount;
           const crypto::key_image locked_key_image = out.locked_key_image;
 
+          /* An output whose key image is locked into a master node for exactly
+             this amount is not spendable, so it is left out of the unspent set. */
+          bool should_skip_output = false;
           if (locked_key_image != crypto::key_image{})
-          {
-            for (const auto& item : (*master_node_data).blacklist["result"]["blacklist"])
-            {
-              std::string blacklist_key_image_str = item["key_image"];
-              crypto::key_image blacklist_key_image;
-
-              if (!epee::string_tools::hex_to_pod(blacklist_key_image_str, blacklist_key_image))
-              {
-                std::cerr << "Failed to convert blacklist key image string to crypto::key_image." << std::endl;
-                continue;
-              }
-
-              if (locked_key_image == blacklist_key_image && value_l == item["amount"].get<std::uint64_t>())
-              {
-                should_skip_output = true;
-                break;
-              }
-            }
-
-            if (!should_skip_output)
-            {
-              for (const auto& mn_all : (*master_node_data).master_nodes["result"]["master_node_states"])
-              {
-                if (should_skip_output)
-                  break;
-
-                for (const auto& mn_contrib : mn_all["contributors"])
-                {
-                  std::string address_str = mn_contrib["address"].get<std::string>();
-
-                  if (wallet_address != address_str)
-                    continue;
-
-                  for (const auto& contribution : mn_contrib["locked_contributions"])
-                  {
-                    crypto::key_image check_image;
-                    std::string key_image_str = contribution["key_image"].get<std::string>();
-                    std::uint64_t conAmount = contribution["amount"].get<std::uint64_t>();
-
-                    if (tools::hex_to_type(key_image_str, check_image) && locked_key_image == check_image && value_l == conAmount)
-                    {
-                      should_skip_output = true;
-                      break;
-                    }
-                  }
-                  if (should_skip_output)
-                    break;
-                }
-              }
-            }
-          }
+            should_skip_output = master_node_data->locks_exactly(wallet_address, locked_key_image, value_l);
 
           if (!should_skip_output)
           {
@@ -578,9 +734,11 @@ namespace lws
 
       static expect<response> handle(const request& req, db::storage disk)
       {
-        auto user = open_account(req, std::move(disk));
+        auto user = open_account(req, disk.clone());
         if (!user)
           return user.error();
+
+        note_account_access(disk, user->first);
 
         auto outputs = user->second.get_outputs(user->first.id);
         if (!outputs)
@@ -598,7 +756,7 @@ namespace lws
         resp.scanned_height = std::uint64_t(user->first.scan_height);
         resp.scanned_block_height = resp.scanned_height;
         resp.start_height = std::uint64_t(user->first.start_height);
-        resp.blockchain_height = std::uint64_t(last->id);
+        resp.blockchain_height = best_chain_height(*last);
         resp.transaction_height = resp.blockchain_height;
 
         // merge input and output info into a single set of txes.
@@ -964,17 +1122,49 @@ namespace lws
             if (is_hidden(account->first))
               return {lws::error::account_not_found};
 
+            const bool reactivate = (account->first == db::account_status::inactive);
+            const db::account found = account->second;
+            reader->finish_read();
+
+            /* An idle-swept account comes back to life here. Without this it
+               would log in successfully and then silently never scan again,
+               because `is_hidden` treats `inactive` as visible. Scanning resumes
+               from the stored height, so only the idle gap is re-scanned. */
+            if (reactivate)
+            {
+              const db::account_address address = found.address;
+              const auto changed = disk.change_status(
+                db::account_status::active, epee::span<const db::account_address>{std::addressof(address), 1}
+              );
+              if (!changed)
+                return changed.error();
+              MINFO("Reactivated idle account " << lmdb::to_native(found.id)
+                << " on login; resuming scan from height " << std::uint64_t(found.scan_height));
+            }
+
+            note_account_access(disk, found);
+
             // Do not count a request for account creation as login
-            return response{false, bool(account->second.flags & db::account_generated_locally)};
+            return response{false, bool(found.flags & db::account_generated_locally)};
           }
           else if (!req.create_account || account != lws::error::account_not_found)
             return account.error();
         }
 
         const auto flags = req.generated_locally ? db::account_generated_locally : db::default_account;
-        // MONERO_CHECK(disk.creation_request(req.creds.address, req.creds.key, flags));
-        MONERO_UNWRAP(disk.add_account(req.creds.address, req.creds.key));
-        // std::cout <<"add_account called\n";
+
+        if (lws::config::auto_accept_accounts)
+        {
+          // create and start scanning immediately
+          MONERO_CHECK(disk.add_account(req.creds.address, req.creds.key, flags));
+        }
+        else
+        {
+          /* Queue for admin approval instead. This is the path that gives
+             --create-queue-max an effect and keeps `list_requests` /
+             `accept_requests create` meaningful. */
+          MONERO_CHECK(disk.creation_request(req.creds.address, req.creds.key, flags));
+        }
         return response{true, req.generated_locally};
       }
     };//login
@@ -1045,6 +1235,36 @@ namespace lws
       return wire::json::to_bytes<response>(*resp);
     }
 
+    //! Admin endpoint: live view of every scan thread.
+    struct scanner_status_
+    {
+      using request = expect<void>;
+
+      expect<void> operator()(wire::json_writer& dest, db::storage disk) const
+      {
+        const lws::scanner_status status = lws::scanner::status();
+
+        // report the chain tip the DB believes in alongside the daemon's
+        std::uint64_t db_height = 0;
+        auto reader = disk.start_read();
+        if (reader)
+        {
+          const auto last = reader->get_last_block();
+          if (last)
+            db_height = std::uint64_t(last->id);
+        }
+
+        wire::object(dest,
+          wire::field("scanner", std::cref(status)),
+          wire::field("db_chain_height", db_height)
+        );
+        return success();
+      }
+
+      expect<void> operator()(wire::json_writer& dest, db::storage disk, const request&) const
+      { return (*this)(dest, std::move(disk)); }
+    };
+
     template<typename T>
     struct admin
     {
@@ -1065,6 +1285,26 @@ namespace lws
       wire::object(source, wire::field("auth", std::ref(unwrap(unwrap(self.auth)))));
     }
 
+    //! \return The admin account's id iff `auth` belongs to one.
+    expect<db::account_id> check_admin_auth(const crypto::secret_key& auth, db::storage& disk)
+    {
+      db::account_address address{};
+      if (!crypto::secret_key_to_public_key(auth, address.view_public))
+        return {error::crypto_failure};
+
+      auto reader = disk.start_read();
+      if (!reader)
+        return reader.error();
+      const auto account = reader->get_account(address);
+      if (!account)
+        return account.error();
+      if (account->first == db::account_status::inactive)
+        return {error::account_not_found};
+      if (!(account->second.flags & db::account_flags::admin_account))
+        return {error::account_not_found};
+      return account->second.id;
+    }
+
     template<typename E>
     expect<epee::byte_slice> call_admin(std::string&& root, db::storage disk)
     {
@@ -1073,25 +1313,53 @@ namespace lws
       if (!req)
         return req.error();
 
-      {
-        db::account_address address{};
-        if (!crypto::secret_key_to_public_key(req->auth, address.view_public))
-          return {error::crypto_failure};
-
-        auto reader = disk.start_read();
-        if (!reader)
-          return reader.error();
-        const auto account = reader->get_account(address);
-        if (!account)
-          return account.error();
-        if (account->first == db::account_status::inactive)
-          return {error::account_not_found};
-        if (!(account->second.flags & db::account_flags::admin_account))
-          return {error::account_not_found};
-      }
+      const expect<db::account_id> caller = check_admin_auth(req->auth, disk);
+      if (!caller)
+        return caller.error();
 
       wire::json_slice_writer dest{};
       MONERO_CHECK(E{}(dest, std::move(disk), req->params));
+      return dest.take_bytes();
+    }
+
+    /*! `call_admin`, plus an audit entry naming the caller and the request.
+
+      Used for the endpoints that change state; read-only ones are left
+      unlogged so the log stays useful. */
+    template<typename E>
+    expect<epee::byte_slice> call_admin_audited(std::string&& root, db::storage disk)
+    {
+      using request = typename E::request;
+      // keep a copy for the audit entry before the reader consumes it
+      std::string body{root};
+      const expect<admin<request>> req = wire::json::from_bytes<admin<request>>(std::move(root));
+      if (!req)
+        return req.error();
+
+      const expect<db::account_id> caller = check_admin_auth(req->auth, disk);
+      if (!caller)
+        return caller.error();
+
+      // never record the caller's secret key
+      const auto auth_at = body.find("\"auth\"");
+      if (auth_at != std::string::npos)
+      {
+        const auto end = body.find_first_of(",}", auth_at);
+        body.replace(auth_at, (end == std::string::npos ? body.size() : end) - auth_at, "\"auth\":\"<redacted>\"");
+      }
+      if (512 < body.size())
+        body.resize(512);
+
+      wire::json_slice_writer dest{};
+      const expect<void> result = E{}(dest, std::move(disk), req->params);
+
+      rpc::record_admin_action(
+        std::uint64_t(lmdb::to_native(*caller)),
+        std::string{E::endpoint_name},
+        (result ? std::string{"ok "} : std::string{"failed "}) + body
+      );
+
+      MONERO_CHECK(result);
       return dest.take_bytes();
     }
 
@@ -1100,7 +1368,104 @@ namespace lws
       char const* const name;
       expect<epee::byte_slice> (*const run)(std::string&&, db::storage);
       const unsigned max_size;
+      //! Response MIME type; Prometheus needs plain text, everything else is JSON.
+      char const* const mime = "application/json";
     };
+
+    /*! Admin endpoint: Prometheus exposition of scanner health.
+
+      Deliberately not routed through the `wire` JSON writer - the point of this
+      endpoint is that an existing scrape config can consume it unchanged. */
+    expect<epee::byte_slice> serve_metrics(std::string&& root, db::storage disk)
+    {
+      // still require admin auth; parse and validate the credential the same way
+      const expect<admin<expect<void>>> req =
+        wire::json::from_bytes<admin<expect<void>>>(std::move(root));
+      if (!req)
+        return req.error();
+      const expect<db::account_id> caller = check_admin_auth(req->auth, disk);
+      if (!caller)
+        return caller.error();
+
+      const lws::scanner_status status = lws::scanner::status();
+
+      std::uint64_t lowest = 0;
+      bool have_lowest = false;
+      std::uint64_t alive = 0;
+      for (const auto& thread : status.threads)
+      {
+        if (!thread.alive)
+          continue;
+        ++alive;
+        if (!have_lowest || thread.current_height < lowest)
+        {
+          lowest = thread.current_height;
+          have_lowest = true;
+        }
+      }
+      const std::uint64_t behind =
+        (status.daemon_height > lowest) ? status.daemon_height - lowest : 0;
+
+      std::ostringstream out{};
+      const auto metric = [&out] (const char* name, const char* help, const char* type)
+      {
+        out << "# HELP " << name << ' ' << help << '\n'
+            << "# TYPE " << name << ' ' << type << '\n';
+      };
+
+      metric("lws_scanner_running", "1 when the scanner is running.", "gauge");
+      out << "lws_scanner_running " << (status.running ? 1 : 0) << '\n';
+
+      metric("lws_scan_threads", "Scan threads currently alive.", "gauge");
+      out << "lws_scan_threads " << alive << '\n';
+
+      metric("lws_daemon_height", "Chain tip last seen by a scan thread.", "gauge");
+      out << "lws_daemon_height " << status.daemon_height << '\n';
+
+      metric("lws_blocks_behind", "Blocks between the chain tip and the slowest scan thread.", "gauge");
+      out << "lws_blocks_behind " << behind << '\n';
+
+      metric("lws_scan_restarts_total", "Scan-thread teardowns since start.", "counter");
+      out << "lws_scan_restarts_total " << status.restarts << '\n';
+
+      metric("lws_accounts_deactivated_total", "Accounts idle-swept since start.", "counter");
+      out << "lws_accounts_deactivated_total " << status.deactivated << '\n';
+
+      metric("lws_last_sweep_timestamp", "Unix time of the last idle sweep; 0 if never.", "gauge");
+      out << "lws_last_sweep_timestamp " << status.last_sweep << '\n';
+
+      metric("lws_thread_height", "Height of the most recent committed batch.", "gauge");
+      for (const auto& thread : status.threads)
+        out << "lws_thread_height{thread=\"" << thread.index << "\"} " << thread.current_height << '\n';
+
+      metric("lws_thread_blocks_per_second", "Scan rate of the most recent batch.", "gauge");
+      for (const auto& thread : status.threads)
+        out << "lws_thread_blocks_per_second{thread=\"" << thread.index << "\"} "
+            << std::uint64_t(thread.blocks_per_second) << '\n';
+
+      metric("lws_thread_accounts", "Accounts carried by a scan thread.", "gauge");
+      for (const auto& thread : status.threads)
+        out << "lws_thread_accounts{thread=\"" << thread.index << "\"} " << thread.accounts.size() << '\n';
+
+      metric("lws_thread_group_span", "Height span of a scan thread's account group.", "gauge");
+      for (const auto& thread : status.threads)
+        out << "lws_thread_group_span{thread=\"" << thread.index << "\"} "
+            << (thread.group_high - thread.group_low) << '\n';
+
+      metric("lws_thread_consecutive_failures", "Failed batches since the last good one.", "gauge");
+      for (const auto& thread : status.threads)
+        out << "lws_thread_consecutive_failures{thread=\"" << thread.index << "\"} "
+            << thread.consecutive_failures << '\n';
+
+      metric("lws_thread_seconds_since_commit", "Seconds since a thread last committed; -1 if never.", "gauge");
+      const std::int64_t now = std::int64_t(std::time(nullptr));
+      for (const auto& thread : status.threads)
+        out << "lws_thread_seconds_since_commit{thread=\"" << thread.index << "\"} "
+            << (thread.last_commit ? now - thread.last_commit : -1) << '\n';
+
+      const std::string body = out.str();
+      return epee::byte_slice{{epee::strspan<std::uint8_t>(body)}};
+    }
 
     constexpr const endpoint endpoints[] =
         {
@@ -1116,13 +1481,19 @@ namespace lws
     };
     constexpr const endpoint admin_endpoints[] =
     {
-      {"/accept_requests",       call_admin<rpc::accept_requests_>, 50 * 1024},
-      {"/add_account",           call_admin<rpc::add_account_>,     50 * 1024},
-      {"/list_accounts",         call_admin<rpc::list_accounts_>,   100},
+      {"/accept_requests",       call_admin_audited<rpc::accept_requests_>, 50 * 1024},
+      {"/account_info",          call_admin<rpc::account_info_>,      1024},
+      {"/add_account",           call_admin_audited<rpc::add_account_>,     50 * 1024},
+      {"/admin_log",             call_admin<rpc::admin_log_>,         1024},
+      {"/delete_account",        call_admin_audited<rpc::delete_account_>, 50 * 1024},
+      {"/list_accounts",         call_admin<rpc::list_accounts_>,   4 * 1024},
       {"/list_requests",         call_admin<rpc::list_requests_>,   100},
-      {"/modify_account_status", call_admin<rpc::modify_account_>,  50 * 1024},
-      {"/reject_requests",       call_admin<rpc::reject_requests_>, 50 * 1024},
-      {"/rescan",                call_admin<rpc::rescan_>,          50 * 1024},
+      {"/metrics",               serve_metrics,                      1024, "text/plain; version=0.0.4"},
+      {"/modify_account_status", call_admin_audited<rpc::modify_account_>,  50 * 1024},
+      {"/reject_requests",       call_admin_audited<rpc::reject_requests_>, 50 * 1024},
+      {"/rescan",                call_admin_audited<rpc::rescan_>,          50 * 1024},
+      {"/rollback",              call_admin_audited<rpc::rollback_>,          1024},
+      {"/scanner_status",        call_admin<scanner_status_>,       100},
       {"/validate",              call_admin<rpc::validate_>,        50 * 1024}
     };
 
@@ -1164,6 +1535,7 @@ namespace lws
       , admin_prefix()
     {
       assert(std::is_sorted(std::begin(endpoints), std::end(endpoints), by_name));
+      assert(std::is_sorted(std::begin(admin_endpoints), std::end(admin_endpoints), by_name));
     }
 
     const endpoint* get_endpoint(boost::string_ref uri) const
@@ -1211,13 +1583,15 @@ namespace lws
         return true;
       }
 
-      // if (handler->max_size < query.m_body.size())
-      // {
-      //   MINFO("Client exceeded maximum body size (" << handler->max_size << " bytes)");
-      //   response.m_response_code = 400;
-      //   response.m_response_comment = "Bad Request";
-      //   return true;
-      // }
+      if (handler->max_size < query.m_body.size())
+      {
+        MINFO("Client exceeded maximum body size for " << handler->name
+          << " (" << query.m_body.size() << " > " << handler->max_size << " bytes) from "
+          << ctx.m_remote_address.str());
+        response.m_response_code = 400;
+        response.m_response_comment = "Bad Request";
+        return true;
+      }
 
       if (query.m_http_method != http::http_method_post)
       {
@@ -1226,8 +1600,32 @@ namespace lws
         return true;
       }
 
-      // \TODO remove copy of json string here :/
-      auto body = handler->run(std::string{query.m_body}, disk.clone());
+      /* Handlers throw on corrupt database state (see the `no receive for spend`
+         logic error) and on MONERO_UNWRAP failures. Letting that escape into the
+         epee HTTP layer drops the connection instead of answering; contain it. */
+      expect<epee::byte_slice> body{common_error::kInvalidArgument};
+      try
+      {
+        // \TODO remove copy of json string here :/
+        body = handler->run(std::string{query.m_body}, disk.clone());
+      }
+      catch (const std::exception& e)
+      {
+        MERROR("Unhandled exception in " << handler->name << " from "
+          << ctx.m_remote_address.str() << ": " << e.what());
+        response.m_response_code = 500;
+        response.m_response_comment = "Internal Server Error";
+        return true;
+      }
+      catch (...)
+      {
+        MERROR("Unhandled exception in " << handler->name << " from "
+          << ctx.m_remote_address.str() << ": unknown");
+        response.m_response_code = 500;
+        response.m_response_comment = "Internal Server Error";
+        return true;
+      }
+
       if (!body)
       {
         MINFO(body.error().message() << " from " << ctx.m_remote_address.str() << " on " << handler->name);
@@ -1257,8 +1655,8 @@ namespace lws
 
       response.m_response_code = 200;
       response.m_response_comment = "OK";
-      response.m_mime_tipe = "application/json";
-      response.m_header_info.m_content_type = "application/json";
+      response.m_mime_tipe = handler->mime;
+      response.m_header_info.m_content_type = handler->mime;
         response.m_body.assign(reinterpret_cast<const char*>(body->data()), body->size()); // \TODO Remove copy here too!s
       return true;
     }
