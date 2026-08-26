@@ -360,6 +360,8 @@ namespace cryptonote::rpc {
 
   void parse_request(GET_BLOCKS_FAST_RPC& get_blocks_fast_rpc, rpc_input in) {
     get_values(in,
+        "blob",         get_blocks_fast_rpc.request.blob,
+        "max_count",    get_blocks_fast_rpc.request.max_count,
         "no_miner_tx",  get_blocks_fast_rpc.request.no_miner_tx,
         "prune",        get_blocks_fast_rpc.request.prune,
         "start_height", required{get_blocks_fast_rpc.request.start_height});

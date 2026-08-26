@@ -135,6 +135,8 @@ namespace cryptonote::rpc {
       uint64_t    start_height;          // The starting block's height.
       bool        prune;                 // Prunes the blockchain, drops off 7/8 off the block iirc.
       bool        no_miner_tx;           // Optional (false by default).
+      uint64_t    max_count;             // Optional cap on blocks returned; 0 or >MAX_COUNT means MAX_COUNT.
+      bool        blob;                  // Return raw hex block/tx blobs instead of JSON. Much cheaper on both ends.
     } request;
 
     // struct tx_output_indices

@@ -424,9 +424,86 @@ namespace cryptonote::rpc {
     
     std::vector<std::pair<std::pair<blobdata, crypto::hash>, std::vector<std::pair<crypto::hash, blobdata> > > > blocks;
     uint64_t current_height, start_height;
-    if(!m_core.find_blockchain_supplement(get_blocks_fast_rpc.request.start_height, std::list<crypto::hash>{}, blocks, current_height, start_height, get_blocks_fast_rpc.request.prune, !get_blocks_fast_rpc.request.no_miner_tx, GET_BLOCKS_FAST_RPC::MAX_COUNT))
+    // clients may ask for a smaller batch (e.g. to back off after a timeout)
+    const size_t requested_count = get_blocks_fast_rpc.request.max_count;
+    const size_t block_limit = (requested_count == 0 || requested_count > GET_BLOCKS_FAST_RPC::MAX_COUNT)
+      ? GET_BLOCKS_FAST_RPC::MAX_COUNT
+      : requested_count;
+
+    if(!m_core.find_blockchain_supplement(get_blocks_fast_rpc.request.start_height, std::list<crypto::hash>{}, blocks, current_height, start_height, get_blocks_fast_rpc.request.prune, !get_blocks_fast_rpc.request.no_miner_tx, block_limit))
     {
       get_blocks_fast_rpc.response["status"] = "Failed";
+      return;
+    }
+
+    /* Blob mode: hand back the raw block and transaction blobs as hex and let the
+       caller deserialise them. The JSON path below round-trips every block and
+       every transaction through obj_to_json_str -> parse -> dump, then embeds the
+       result as an escaped string inside the response, which the caller must undo.
+       For a light wallet server that only needs tx pubkeys, key offsets, key
+       images, output keys and the rct base, that work is pure overhead. */
+    if (get_blocks_fast_rpc.request.blob)
+    {
+      size_t blob_size = 0, blob_ntxes = 0;
+      for (auto& bd : blocks)
+      {
+        cryptonote::block blk;
+        if (!parse_and_validate_block_from_blob(bd.first.first, blk))
+        {
+          get_blocks_fast_rpc.response["status"] = "Failed";
+          return;
+        }
+        if (bd.second.size() != blk.tx_hashes.size())
+        {
+          get_blocks_fast_rpc.response["status"] = "Failed";
+          return;
+        }
+
+        block_output_indices_rpc indices;
+        {
+          tx_output_indices_rpc tx_indices;
+          if (!m_core.get_tx_outputs_gindexs(get_transaction_hash(blk.miner_tx), tx_indices))
+          {
+            get_blocks_fast_rpc.response["status"] = "Failed";
+            return;
+          }
+          indices.push_back(std::move(tx_indices));
+        }
+
+        nlohmann::json txs_hex = nlohmann::json::array();
+        auto hash_it = blk.tx_hashes.begin();
+        for (const auto& tx_blob : bd.second)
+        {
+          tx_output_indices_rpc tx_indices;
+          if (!m_core.get_tx_outputs_gindexs(*hash_it, tx_indices))
+          {
+            get_blocks_fast_rpc.response["status"] = "Failed";
+            return;
+          }
+          indices.push_back(std::move(tx_indices));
+          txs_hex.push_back(oxenc::to_hex(tx_blob.second.begin(), tx_blob.second.end()));
+          blob_size += tx_blob.second.size();
+          ++blob_ntxes;
+          ++hash_it;
+        }
+
+        nlohmann::json entry;
+        entry["block"] = oxenc::to_hex(bd.first.first.begin(), bd.first.first.end());
+        entry["transactions"] = std::move(txs_hex);
+        get_blocks_fast_rpc.response["blocks"].push_back(std::move(entry));
+
+        blob_size += bd.first.first.size();
+        output_indices_rpc.push_back(std::move(indices));
+      }
+
+      get_blocks_fast_rpc.response["blob"] = true;
+      get_blocks_fast_rpc.response["output_indices"] = output_indices_rpc;
+      get_blocks_fast_rpc.response["start_height"] = start_height;
+      get_blocks_fast_rpc.response["current_height"] = current_height;
+      get_blocks_fast_rpc.response["status"] = STATUS_OK;
+
+      MGINFO("on_get_blocks (blob): " << blocks.size() << " blocks, "
+        << blob_ntxes << " txes, size " << blob_size);
       return;
     }
 

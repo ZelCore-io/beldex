@@ -2876,7 +2876,11 @@ bool Blockchain::find_blockchain_supplement(const uint64_t req_start_block, cons
     std::vector<cryptonote::blobdata> txs;
     if (pruned)
     {
-      CHECK_AND_ASSERT_MES(m_db->get_pruned_tx_blobs_from(b.tx_hashes.front(), b.tx_hashes.size(), txs), false, "Failed to retrieve all transactions needed");
+      // b.tx_hashes.front() is UB on the (very common) empty block
+      if (!b.tx_hashes.empty())
+      {
+        CHECK_AND_ASSERT_MES(m_db->get_pruned_tx_blobs_from(b.tx_hashes.front(), b.tx_hashes.size(), txs), false, "Failed to retrieve all transactions needed");
+      }
     }
     else
     {
