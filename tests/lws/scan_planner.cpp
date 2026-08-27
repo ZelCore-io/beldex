@@ -151,6 +151,51 @@ TEST(lws_scan_planner, splits_large_bands_when_threads_are_spare)
   EXPECT_GT(groups.size(), 1u) << "spare threads were left idle";
 }
 
+// Scanning cost is linear in the accounts a thread carries, so the slowest
+// thread sets the pace. Halving the largest band repeatedly used to leave 866
+// accounts as six groups of 108 and four of 54 - half the threads idle for half
+// of every batch.
+TEST(lws_scan_planner, spare_threads_split_a_band_evenly)
+{
+  for (std::size_t threads : {2u, 3u, 8u, 10u, 14u})
+  {
+    std::vector<std::uint64_t> heights(866, 5'696'743);
+    const auto groups = lws::plan_scan_groups(heights, threads, default_span);
+
+    expect_well_formed(heights, groups, threads);
+    ASSERT_EQ(threads, groups.size()) << "threads=" << threads;
+
+    std::size_t smallest = heights.size(), largest = 0;
+    for (auto const& group : groups)
+    {
+      smallest = std::min(smallest, group.size());
+      largest = std::max(largest, group.size());
+    }
+    EXPECT_LE(largest - smallest, 1u)
+      << "threads=" << threads << ": group sizes differ by " << (largest - smallest)
+      << " (" << smallest << ".." << largest << "), so the slowest thread holds up the rest";
+  }
+}
+
+TEST(lws_scan_planner, spare_threads_favour_the_busiest_band)
+{
+  // one big band at the tip and one laggard; the spare threads should go to the
+  // band that actually has accounts to spread, not to the single account
+  std::vector<std::uint64_t> heights{0};
+  heights.insert(heights.end(), 100, 5'000'000);
+
+  const auto groups = lws::plan_scan_groups(heights, 5, default_span);
+  expect_well_formed(heights, groups, 5);
+
+  for (auto const& group : groups)
+  {
+    if (heights[group.front()] == 0)
+      EXPECT_EQ(1u, group.size()) << "the laggard should stay alone";
+    else
+      EXPECT_LE(group.size(), 26u) << "the busy band was not spread across the spare threads";
+  }
+}
+
 TEST(lws_scan_planner, single_thread_still_plans_everything)
 {
   std::vector<std::uint64_t> heights{0, 1000, 2'000'000, 3'000'000};

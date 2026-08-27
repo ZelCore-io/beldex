@@ -61,22 +61,61 @@ namespace lws
       groups.erase(groups.begin() + best + 1);
     }
 
-    /* (3) spare threads - split the largest band in half. Both halves scan the
-       same blocks, which doubles the daemon traffic for that band, so only do it
-       while there is genuinely an idle thread to hand the work to. */
-    while (groups.size() < thread_count)
-    {
-      const auto largest = std::max_element(
-        groups.begin(), groups.end(),
-        [] (auto const& l, auto const& r) { return l.size() < r.size(); }
-      );
-      if (largest == groups.end() || largest->size() < 2)
-        break;
+    /* (3) Spare threads. Scanning cost is linear in the number of accounts a
+       thread carries, so the slowest thread sets the pace and the split has to
+       be even. Repeatedly halving the largest band does not achieve that: 866
+       accounts over 10 threads converges on six groups of 108 and four of 54,
+       leaving half the threads idle for half of every batch.
 
-      const std::size_t half = largest->size() / 2;
-      std::vector<std::size_t> spun_off{largest->begin() + half, largest->end()};
-      largest->erase(largest->begin() + half, largest->end());
-      groups.push_back(std::move(spun_off));
+       Instead work out how many threads each band deserves - handing each spare
+       thread to whichever band currently has the worst accounts-per-thread
+       ratio - then cut each band into that many equal chunks. */
+    if (groups.size() < thread_count)
+    {
+      std::vector<std::size_t> quota(groups.size(), 1);
+      std::size_t assigned = groups.size();
+
+      while (assigned < thread_count)
+      {
+        std::size_t best = 0;
+        double best_load = -1.0;
+        bool any = false;
+        for (std::size_t i = 0; i < groups.size(); ++i)
+        {
+          if (groups[i].size() <= quota[i])
+            continue; // already one account per thread
+          const double load = double(groups[i].size()) / double(quota[i] + 1);
+          if (best_load < load)
+          {
+            best_load = load;
+            best = i;
+            any = true;
+          }
+        }
+        if (!any)
+          break; // every band is already split as far as it can go
+        ++quota[best];
+        ++assigned;
+      }
+
+      std::vector<std::vector<std::size_t>> split{};
+      split.reserve(assigned);
+      for (std::size_t i = 0; i < groups.size(); ++i)
+      {
+        const std::size_t chunks = quota[i];
+        const std::size_t total = groups[i].size();
+        std::size_t taken = 0;
+        for (std::size_t c = 0; c < chunks; ++c)
+        {
+          // spread the remainder over the first chunks so sizes differ by at most one
+          const std::size_t take = total / chunks + (c < total % chunks ? 1 : 0);
+          split.emplace_back(
+            groups[i].begin() + taken, groups[i].begin() + taken + take
+          );
+          taken += take;
+        }
+      }
+      groups = std::move(split);
     }
 
     return groups;

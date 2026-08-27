@@ -202,6 +202,15 @@ namespace lws
         `check_loop` re-read the account list and re-plan. */
     constexpr const unsigned max_consecutive_failures = 10;
 
+    /*! Scan threads deliberately left out of the initial plan.
+
+        Accounts that appear while scanning is under way are handed to a spare
+        thread; without any spare, every new login costs a full teardown, chain
+        sync and re-plan. Holding two back trades a little parallelism for
+        logins that cost nothing, which matters a great deal more when the
+        server is fronting a wallet. */
+    constexpr const std::size_t pickup_reserve = 2;
+
     /*! A scan pass shorter than this is treated as a failure to make progress,
         and the next pass is delayed. */
     constexpr const std::chrono::seconds min_healthy_pass{5};
@@ -1352,12 +1361,18 @@ namespace lws
 
       const std::size_t total_users = users.size();
       registry().clear_threads();
-      auto groups = partition_by_height(std::move(users), thread_count, options.max_group_span);
+
+      // hold a couple of threads back so later arrivals do not force a re-plan
+      const std::size_t planned_threads =
+        (pickup_reserve < thread_count) ? thread_count - pickup_reserve : thread_count;
+      auto groups =
+        partition_by_height(std::move(users), planned_threads, options.max_group_span);
 
       // room for the initial groups plus any picked up while scanning
       threads.reserve(thread_count);
       MINFO("Starting scan loops on " << groups.size() << " thread(s) with "
-        << total_users << " account(s)");
+        << total_users << " account(s); " << (thread_count - groups.size())
+        << " thread(s) held back for accounts that appear later");
 
       for (std::size_t i = 0; i < groups.size(); ++i)
       {
